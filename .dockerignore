@@ -1,0 +1,15 @@
+data/
+logs/
+media/
+models/
+bin/
+*.db
+*.db-wal
+*.db-shm
+.venv/
+__pycache__/
+*.pyc
+.git/
+.DS_Store
+config.toml
+*.plist

@@ -1,0 +1,34 @@
+# Binaries
+bin/
+bridge/whatsapp-bridge
+
+# Runtime data
+data/
+logs/
+/media/
+models/
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# Config with secrets
+config.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+mcp-server/.venv/
+dashboard/.venv/
+*.egg-info/
+dist/
+.ruff_cache/
+.mypy_cache/
+
+# launchd plists (generated with local paths)
+*.plist
+
+# OS
+.DS_Store

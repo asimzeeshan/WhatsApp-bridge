@@ -1,0 +1,104 @@
+services:
+  # --- Core ---
+
+  bridge:
+    build:
+      context: ./bridge
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./media:/app/media
+      - ./config.toml:/app/config.toml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mcp-server:
+    build:
+      context: ./mcp-server
+    environment:
+      BRIDGE_URL: http://bridge:8080
+    depends_on:
+      bridge:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Database ---
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: whatsapp
+      POSTGRES_USER: bridge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bridge}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bridge -d whatsapp"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # --- Vector Search (pgvector in PostgreSQL) ---
+
+  embedder:
+    build:
+      context: ./embedder
+    environment:
+      PG_DSN: postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/whatsapp?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  transcriber:
+    build:
+      context: ./transcriber
+    environment:
+      PG_DSN: postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/whatsapp?sslmode=disable
+      WHISPER_URL: http://whisper:8000
+      BRIDGE_URL: http://bridge:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bridge:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - whisper
+
+  # --- Optional ---
+
+  dashboard:
+    build:
+      context: ./dashboard
+    ports:
+      - "127.0.0.1:9090:9090"
+    environment:
+      BRIDGE_URL: http://bridge:8080
+      DB_DRIVER: postgres
+      PG_DSN: postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/whatsapp?sslmode=disable
+    depends_on:
+      bridge:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - dashboard
+
+  whisper:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    ports:
+      - "127.0.0.1:8443:8000"
+    volumes:
+      - ./data/whisper-cache:/home/ubuntu/.cache/huggingface/hub
+    restart: unless-stopped
+    profiles:
+      - whisper
