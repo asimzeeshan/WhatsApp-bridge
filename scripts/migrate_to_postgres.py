@@ -2,7 +2,7 @@
 """Migrate data from SQLite to PostgreSQL.
 
 Usage:
-    python3 scripts/migrate_to_postgres.py --sqlite data/whatsapp.db --pg "postgres://bridge:PASSWORD@localhost:5432/whatsapp?sslmode=disable"
+    python3 scripts/migrate_to_postgres.py --sqlite data/whatsapp.db --pg "$PG_DSN"
 
 This script is idempotent - safe to run multiple times. Uses ON CONFLICT to skip duplicates.
 The SQLite database is NOT modified.

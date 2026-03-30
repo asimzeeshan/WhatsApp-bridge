@@ -4,7 +4,7 @@ Handles retries gracefully - if Whisper is down, backs off and retries next cycl
 If audio file is missing on disk, attempts re-download via bridge API.
 
 Usage:
-    whatsapp-transcriber --pg "postgres://bridge:PASSWORD@localhost:5432/whatsapp" --whisper "http://127.0.0.1:8443"
+    whatsapp-transcriber --pg "$PG_DSN" --whisper "$WHISPER_URL"
 
 Environment variables (alternative to CLI args):
     PG_DSN - PostgreSQL connection string
@@ -294,7 +294,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
 
     parser = argparse.ArgumentParser(description="WhatsApp voice note transcription worker")
-    parser.add_argument("--pg", default=os.environ.get("PG_DSN", "postgres://bridge:PASSWORD@localhost:5432/whatsapp?sslmode=disable"))
+    parser.add_argument("--pg", default=os.environ.get("PG_DSN", ""))
     parser.add_argument("--whisper", default=os.environ.get("WHISPER_URL", DEFAULT_WHISPER_URL))
     parser.add_argument("--model", default=os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL))
     parser.add_argument("--bridge", default=os.environ.get("BRIDGE_URL", DEFAULT_BRIDGE_URL))

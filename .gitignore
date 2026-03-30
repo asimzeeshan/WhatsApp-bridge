@@ -15,6 +15,7 @@ models/
 
 # Config with secrets
 config.toml
+.env
 
 # Python
 __pycache__/

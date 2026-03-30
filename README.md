@@ -32,7 +32,9 @@ Claude Code <-stdio-> Python MCP Server <-HTTP-> Go Bridge <-WebSocket-> WhatsAp
 ```bash
 git clone https://github.com/asimzeeshan/WhatsApp-bridge.git
 cd WhatsApp-bridge
+cp .env.example .env
 cp config.example.toml config.toml
+# Edit .env: set your POSTGRES_PASSWORD
 # Edit config.toml: set bridge.database.driver = "postgres"
 
 # Start core stack
@@ -197,7 +199,7 @@ All MCP tools accept an optional `account` parameter. Send operations are blocke
 
 ## Configuration
 
-See `config.example.toml` for all settings. Key options:
+Credentials live in `.env` (copy from `.env.example`). Bridge settings in `config.toml` (copy from `config.example.toml`).
 
 ```toml
 [bridge]
@@ -205,7 +207,7 @@ addr = "127.0.0.1:8080"
 
 [bridge.database]
 driver = "postgres"  # or "sqlite"
-dsn = "postgres://bridge:YOUR_PASSWORD@localhost:5432/whatsapp?sslmode=disable"
+# DSN set in .env as PG_DSN
 
 [bridge.ratelimit]
 messages_per_second = 0.5
@@ -251,9 +253,7 @@ whisper_url = "http://127.0.0.1:8443/inference"
 For more robust handling with retry logic, run the Python transcriber worker:
 ```bash
 cd transcriber
-uv run whatsapp-transcriber \
-  --pg "postgres://bridge:YOUR_PASSWORD@localhost:5432/whatsapp?sslmode=disable" \
-  --whisper "http://127.0.0.1:8443"
+uv run whatsapp-transcriber --pg "$PG_DSN" --whisper "$WHISPER_URL"
 ```
 
 The worker:

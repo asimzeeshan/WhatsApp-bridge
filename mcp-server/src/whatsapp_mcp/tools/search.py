@@ -6,7 +6,7 @@ import time
 
 from whatsapp_mcp.server import mcp
 
-PG_DSN = os.environ.get("PG_DSN", "postgres://bridge:PASSWORD@localhost:5432/whatsapp?sslmode=disable")
+PG_DSN = os.environ.get("PG_DSN", "")
 
 # Lazy-loaded clients
 _pg_conn = None

@@ -1,10 +1,10 @@
 """Embedding worker: reads messages from PostgreSQL, embeds them, stores vectors in pgvector.
 
 Usage:
-    whatsapp-embedder --pg "postgres://bridge:PASSWORD@localhost:5432/whatsapp?sslmode=disable"
+    whatsapp-embedder --pg "$PG_DSN"
 
 Environment variables (alternative to CLI args):
-    PG_DSN - PostgreSQL connection string
+    PG_DSN - PostgreSQL connection string (required, or pass via --pg)
     EMBEDDING_MODEL - sentence-transformers model name (default: paraphrase-multilingual-MiniLM-L12-v2)
     BATCH_SIZE - messages per batch (default: 100)
     POLL_INTERVAL - seconds between polls (default: 30)
@@ -193,7 +193,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
 
     parser = argparse.ArgumentParser(description="WhatsApp message embedding worker")
-    parser.add_argument("--pg", default=os.environ.get("PG_DSN", "postgres://bridge:PASSWORD@localhost:5432/whatsapp?sslmode=disable"))
+    parser.add_argument("--pg", default=os.environ.get("PG_DSN", ""))
     parser.add_argument("--model", default=os.environ.get("EMBEDDING_MODEL", DEFAULT_MODEL))
     parser.add_argument("--batch-size", type=int, default=int(os.environ.get("BATCH_SIZE", DEFAULT_BATCH_SIZE)))
     parser.add_argument("--poll-interval", type=int, default=int(os.environ.get("POLL_INTERVAL", DEFAULT_POLL_INTERVAL)))
