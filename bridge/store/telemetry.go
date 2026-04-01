@@ -45,7 +45,7 @@ func (db *DB) IncrementTelemetry(field string) {
 	// field is from a fixed whitelist above, safe to interpolate
 	db.Exec(fmt.Sprintf(`
 		INSERT INTO telemetry_daily (date, %s) VALUES (?, 1)
-		ON CONFLICT(date) DO UPDATE SET %s = %s + 1`, field, field, field), date)
+		ON CONFLICT(date) DO UPDATE SET %s = telemetry_daily.%s + 1`, field, field, field), date)
 }
 
 func (db *DB) GetDailyTelemetry(date string) (*DailyTelemetry, error) {
