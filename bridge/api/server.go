@@ -53,6 +53,7 @@ func NewServer(db *store.DB, connMgr *connection.Manager, cfg *config.Config, lo
 		r.Get("/messages", s.handleListMessages)
 		r.Get("/messages/{id}/context", s.handleMessageContext)
 		r.Get("/check", s.handleCheckNewMessages)
+		r.Post("/check/triggers", s.handleCheckTriggers)
 
 		// Chats
 		r.Get("/chats", s.handleListChats)

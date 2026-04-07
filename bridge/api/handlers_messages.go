@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -83,5 +84,59 @@ func (s *Server) handleCheckNewMessages(w http.ResponseWriter, r *http.Request) 
 		Messages: msgs,
 		Count:    len(msgs),
 		JID:      jid,
+	})
+}
+
+func (s *Server) handleCheckTriggers(w http.ResponseWriter, r *http.Request) {
+	var req TriggerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_JSON", "invalid request body")
+		return
+	}
+
+	if len(req.JIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "MISSING_FIELD", "jids is required and must not be empty")
+		return
+	}
+
+	// Validate all JIDs
+	for _, jid := range req.JIDs {
+		if !isValidJID(jid) {
+			writeError(w, http.StatusBadRequest, "INVALID_JID", "invalid jid: "+jid)
+			return
+		}
+	}
+
+	if req.Limit <= 0 {
+		req.Limit = 100
+	}
+
+	filters := store.TriggerFilters{
+		MentionJID: req.Filters.MentionJID,
+		SenderJIDs: req.Filters.SenderJIDs,
+	}
+
+	result, err := s.db.CheckTriggersMulti(req.JIDs, filters, req.Limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "DB_ERROR", err.Error())
+		return
+	}
+
+	// Convert store response to API response
+	groups := make(map[string]TriggerGroupResult)
+	for jid, gr := range result.Groups {
+		msgs := gr.Messages
+		if msgs == nil {
+			msgs = []store.Message{}
+		}
+		groups[jid] = TriggerGroupResult{
+			Count:    gr.Count,
+			Messages: msgs,
+		}
+	}
+
+	writeJSON(w, http.StatusOK, TriggerResponse{
+		Total:  result.Total,
+		Groups: groups,
 	})
 }

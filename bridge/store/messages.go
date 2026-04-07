@@ -194,6 +194,115 @@ func (db *DB) CheckNewMessages(jid string, limit int) ([]Message, error) {
 	return msgs, nil
 }
 
+// TriggerFilters mirrors api.TriggerFilters for the store layer.
+type TriggerFilters struct {
+	MentionJID string
+	SenderJIDs []string
+}
+
+// TriggerGroupResult holds messages for a single JID.
+type TriggerGroupResult struct {
+	Count    int       `json:"count"`
+	Messages []Message `json:"messages"`
+}
+
+// TriggerResponse is the result of CheckTriggersMulti.
+type TriggerResponse struct {
+	Total  int                           `json:"total"`
+	Groups map[string]TriggerGroupResult `json:"groups"`
+}
+
+// CheckTriggersMulti checks multiple JIDs for new messages in a single call,
+// using per-JID watermarks. This replaces N separate CheckNewMessages calls.
+func (db *DB) CheckTriggersMulti(jids []string, filters TriggerFilters, limit int) (*TriggerResponse, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if len(jids) == 0 {
+		return &TriggerResponse{Groups: map[string]TriggerGroupResult{}}, nil
+	}
+
+	// 1. Batch read all watermarks
+	watermarks := make(map[string]int64)
+	placeholders := make([]string, len(jids))
+	args := make([]any, len(jids))
+	for i, jid := range jids {
+		placeholders[i] = "?"
+		args[i] = jid
+	}
+	phStr := strings.Join(placeholders, ", ")
+
+	rows, err := db.Query(fmt.Sprintf("SELECT jid, last_timestamp_ms FROM watermarks WHERE jid IN (%s)", phStr), args...)
+	if err != nil {
+		return nil, fmt.Errorf("batch read watermarks: %w", err)
+	}
+	for rows.Next() {
+		var jid string
+		var ts int64
+		if err := rows.Scan(&jid, &ts); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan watermark: %w", err)
+		}
+		watermarks[jid] = ts
+	}
+	rows.Close()
+
+	// 2. Initialize missing watermarks to now
+	now := time.Now().UnixMilli()
+	for _, jid := range jids {
+		if _, exists := watermarks[jid]; !exists {
+			db.Exec("INSERT INTO watermarks (jid, last_timestamp_ms) VALUES (?, ?) ON CONFLICT(jid) DO NOTHING", jid, now)
+			watermarks[jid] = now
+		}
+	}
+
+	// 3. Query messages per-JID (each has its own watermark threshold)
+	// Build a UNION query or iterate per JID. Given that JID count is small (5-10),
+	// iterating is cleaner and avoids complex SQL.
+	resp := &TriggerResponse{
+		Groups: make(map[string]TriggerGroupResult),
+	}
+	totalCount := 0
+
+	for _, jid := range jids {
+		wm := watermarks[jid]
+
+		queryStr := `SELECT id, chat_jid, sender, sender_name, content, timestamp,
+			is_from_me, media_type, mime_type, filename, file_length, push_name,
+			quoted_message_id, quoted_participant
+			FROM messages
+			WHERE chat_jid = ? AND timestamp > ? AND is_from_me = FALSE
+			ORDER BY timestamp ASC LIMIT ?`
+
+		msgRows, err := db.Query(queryStr, jid, wm, limit)
+		if err != nil {
+			return nil, fmt.Errorf("query messages for %s: %w", jid, err)
+		}
+
+		msgs, _, err := scanMessages(msgRows, 0)
+		if err != nil {
+			return nil, fmt.Errorf("scan messages for %s: %w", jid, err)
+		}
+
+		if len(msgs) == 0 {
+			continue
+		}
+
+		// Update watermark to latest message timestamp for this JID
+		latest := msgs[len(msgs)-1].Timestamp
+		db.Exec("INSERT INTO watermarks (jid, last_timestamp_ms) VALUES (?, ?) ON CONFLICT(jid) DO UPDATE SET last_timestamp_ms = excluded.last_timestamp_ms", jid, latest)
+
+		resp.Groups[jid] = TriggerGroupResult{
+			Count:    len(msgs),
+			Messages: msgs,
+		}
+		totalCount += len(msgs)
+	}
+
+	resp.Total = totalCount
+	return resp, nil
+}
+
 // GetMessageByID retrieves a single message including media_key fields (for download).
 func (db *DB) GetMessageByID(id, chatJID string) (*Message, error) {
 	row := db.QueryRow(`

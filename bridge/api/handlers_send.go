@@ -115,7 +115,10 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Handle quoting
+	// Handle quoting — StanzaID only. Participant and QuotedMessage are
+	// intentionally omitted: LID-format Participant JIDs cause WhatsApp to
+	// misroute reply notifications to wrong group members. StanzaID alone
+	// is sufficient for clients to look up and display the quoted message.
 	if req.QuotedMessageID != "" {
 		if msg.ExtendedTextMessage == nil {
 			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
@@ -127,13 +130,6 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 			msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{}
 		}
 		msg.ExtendedTextMessage.ContextInfo.StanzaID = proto.String(req.QuotedMessageID)
-		// Participant intentionally omitted: setting ContextInfo.Participant
-		// with LID-format JIDs triggers spurious "mentioned" push notifications
-		// for unrelated group members. StanzaID alone is sufficient for
-		// WhatsApp clients to resolve and display the reply correctly.
-		msg.ExtendedTextMessage.ContextInfo.QuotedMessage = &waProto.Message{
-			Conversation: proto.String(""),
-		}
 	}
 
 	// Set ephemeral expiry on text messages

@@ -244,6 +244,49 @@ async def check_new_messages(
 
 
 @mcp.tool()
+async def check_triggers(
+    jids: list[str],
+    mention_jid: str | None = None,
+    sender_jids: list[str] | None = None,
+    limit: int = 100,
+    account: str | None = None,
+) -> str:
+    """Check multiple chats for new messages in a single call.
+
+    Batch version of check_new_messages - checks all JIDs at once using
+    per-JID watermarks. Returns only unseen messages, grouped by JID.
+
+    Args:
+        jids: List of chat JIDs to check (groups, individuals, or LIDs)
+        mention_jid: Optional JID to filter messages mentioning this user
+        sender_jids: Optional list of sender JIDs to include regardless of mentions
+        limit: Max messages per JID (default 100)
+        account: Optional account name (for multi-account setups)
+    """
+    start = time.monotonic()
+    try:
+        b = _get_bridge(account)
+        body: dict = {"jids": jids, "limit": limit, "filters": {}}
+        if mention_jid:
+            body["filters"]["mention_jid"] = mention_jid
+        if sender_jids:
+            body["filters"]["sender_jids"] = sender_jids
+
+        result = await b.post("/api/check/triggers", json=body)
+        duration = int((time.monotonic() - start) * 1000)
+        await b.record_tool_call("check_triggers", duration, True)
+
+        total = result.get("total", 0)
+        if total == 0:
+            return "No new messages."
+        return json.dumps(result)
+    except Exception as e:
+        duration = int((time.monotonic() - start) * 1000)
+        await bridge.record_tool_call("check_triggers", duration, False, str(e))
+        return f"Error: {e}"
+
+
+@mcp.tool()
 async def get_messages(
     jid: str,
     limit: int = 20,

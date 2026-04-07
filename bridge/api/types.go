@@ -83,6 +83,31 @@ type RevokeRequest struct {
 	Sender    string `json:"sender"` // empty = revoke own message; set for admin revoking others
 }
 
+// TriggerFilters controls optional filtering for the trigger check endpoint.
+type TriggerFilters struct {
+	MentionJID string   `json:"mention_jid,omitempty"`
+	SenderJIDs []string `json:"sender_jids,omitempty"`
+}
+
+// TriggerRequest is the body for POST /api/check/triggers.
+type TriggerRequest struct {
+	JIDs    []string       `json:"jids"`
+	Filters TriggerFilters `json:"filters"`
+	Limit   int            `json:"limit,omitempty"`
+}
+
+// TriggerGroupResult holds messages for a single JID in the trigger response.
+type TriggerGroupResult struct {
+	Count    int `json:"count"`
+	Messages any `json:"messages"`
+}
+
+// TriggerResponse is returned by POST /api/check/triggers.
+type TriggerResponse struct {
+	Total  int                           `json:"total"`
+	Groups map[string]TriggerGroupResult `json:"groups"`
+}
+
 // ToolCallRequest is the body for POST /api/telemetry/tool.
 type ToolCallRequest struct {
 	ToolName   string `json:"tool_name"`
