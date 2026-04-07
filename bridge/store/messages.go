@@ -214,7 +214,7 @@ type TriggerResponse struct {
 
 // CheckTriggersMulti checks multiple JIDs for new messages in a single call,
 // using per-JID watermarks. This replaces N separate CheckNewMessages calls.
-func (db *DB) CheckTriggersMulti(jids []string, filters TriggerFilters, limit int) (*TriggerResponse, error) {
+func (db *DB) CheckTriggersMulti(jids []string, filters TriggerFilters, limit int, dryRun bool) (*TriggerResponse, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -251,7 +251,9 @@ func (db *DB) CheckTriggersMulti(jids []string, filters TriggerFilters, limit in
 	now := time.Now().UnixMilli()
 	for _, jid := range jids {
 		if _, exists := watermarks[jid]; !exists {
-			db.Exec("INSERT INTO watermarks (jid, last_timestamp_ms) VALUES (?, ?) ON CONFLICT(jid) DO NOTHING", jid, now)
+			if !dryRun {
+				db.Exec("INSERT INTO watermarks (jid, last_timestamp_ms) VALUES (?, ?) ON CONFLICT(jid) DO NOTHING", jid, now)
+			}
 			watermarks[jid] = now
 		}
 	}
@@ -289,8 +291,10 @@ func (db *DB) CheckTriggersMulti(jids []string, filters TriggerFilters, limit in
 		}
 
 		// Update watermark to latest message timestamp for this JID
-		latest := msgs[len(msgs)-1].Timestamp
-		db.Exec("INSERT INTO watermarks (jid, last_timestamp_ms) VALUES (?, ?) ON CONFLICT(jid) DO UPDATE SET last_timestamp_ms = excluded.last_timestamp_ms", jid, latest)
+		if !dryRun {
+			latest := msgs[len(msgs)-1].Timestamp
+			db.Exec("INSERT INTO watermarks (jid, last_timestamp_ms) VALUES (?, ?) ON CONFLICT(jid) DO UPDATE SET last_timestamp_ms = excluded.last_timestamp_ms", jid, latest)
+		}
 
 		resp.Groups[jid] = TriggerGroupResult{
 			Count:    len(msgs),

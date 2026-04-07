@@ -116,7 +116,7 @@ func (s *Server) handleCheckTriggers(w http.ResponseWriter, r *http.Request) {
 		SenderJIDs: req.Filters.SenderJIDs,
 	}
 
-	result, err := s.db.CheckTriggersMulti(req.JIDs, filters, req.Limit)
+	result, err := s.db.CheckTriggersMulti(req.JIDs, filters, req.Limit, req.DryRun)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "DB_ERROR", err.Error())
 		return

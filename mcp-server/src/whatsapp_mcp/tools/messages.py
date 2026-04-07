@@ -249,6 +249,7 @@ async def check_triggers(
     mention_jid: str | None = None,
     sender_jids: list[str] | None = None,
     limit: int = 100,
+    dry_run: bool = False,
     account: str | None = None,
 ) -> str:
     """Check multiple chats for new messages in a single call.
@@ -261,6 +262,7 @@ async def check_triggers(
         mention_jid: Optional JID to filter messages mentioning this user
         sender_jids: Optional list of sender JIDs to include regardless of mentions
         limit: Max messages per JID (default 100)
+        dry_run: If true, peek at new messages without advancing watermarks
         account: Optional account name (for multi-account setups)
     """
     start = time.monotonic()
@@ -271,6 +273,8 @@ async def check_triggers(
             body["filters"]["mention_jid"] = mention_jid
         if sender_jids:
             body["filters"]["sender_jids"] = sender_jids
+        if dry_run:
+            body["dry_run"] = True
 
         result = await b.post("/api/check/triggers", json=body)
         duration = int((time.monotonic() - start) * 1000)

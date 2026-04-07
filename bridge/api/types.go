@@ -94,6 +94,7 @@ type TriggerRequest struct {
 	JIDs    []string       `json:"jids"`
 	Filters TriggerFilters `json:"filters"`
 	Limit   int            `json:"limit,omitempty"`
+	DryRun  bool           `json:"dry_run,omitempty"`
 }
 
 // TriggerGroupResult holds messages for a single JID in the trigger response.
