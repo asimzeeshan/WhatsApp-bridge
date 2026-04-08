@@ -18,7 +18,7 @@ Claude Code <-stdio-> Python MCP Server <-HTTP-> Go Bridge <-WebSocket-> WhatsAp
 **Components:**
 
 - **Go Bridge** - WhatsApp protocol via whatsmeow, REST API, rate limiting, auto media download, link indexing, voice note transcription, telemetry
-- **Python MCP Server** - 16 MCP tools over stdio, multi-account support
+- **Python MCP Server** - 17 MCP tools over stdio, multi-account support
 - **Python Dashboard** - Optional read-only web UI (FastAPI + HTMX)
 - **Python Embedder** - Background worker that embeds messages into pgvector for semantic search
 - **Python Transcriber** - Background worker that transcribes voice notes via Whisper with retry
@@ -120,7 +120,7 @@ Use `BRIDGE_ACCOUNTS` instead of `BRIDGE_URL`:
 
 All MCP tools accept an optional `account` parameter. Send operations are blocked on read-only accounts.
 
-## MCP Tools (16)
+## MCP Tools (17)
 
 | Tool | Description |
 |------|-------------|
@@ -129,7 +129,8 @@ All MCP tools accept an optional `account` parameter. Send operations are blocke
 | `send_reaction` | React to a message with an emoji |
 | `edit_message` | Edit a previously sent message |
 | `revoke_message` | Delete/revoke a message for everyone |
-| `check_new_messages` | Poll for new messages (server-side watermarks) |
+| `check_new_messages` | Poll for new messages in a single chat (server-side watermarks) |
+| `check_triggers` | Batch check multiple chats at once (single call, per-JID watermarks, dry_run support) |
 | `get_messages` | Retrieve message history |
 | `get_unread_chats` | List chats with unread messages |
 | `get_unread_messages` | Flat list of all unread messages |
@@ -184,7 +185,8 @@ All MCP tools accept an optional `account` parameter. Send operations are blocke
 |----------|--------|-------------|
 | `/api/status` | GET | Connection state and identity |
 | `/api/health` | GET | Resource usage (memory, disk, DB sizes) |
-| `/api/check?jid={jid}` | GET | New messages since last watermark |
+| `/api/check?jid={jid}` | GET | New messages since last watermark (single JID) |
+| `/api/check/triggers` | POST | Batch check multiple JIDs at once (dry_run support) |
 | `/api/send` | POST | Send text message |
 | `/api/send/media` | POST | Send media message |
 | `/api/send/reaction` | POST | Send emoji reaction |
