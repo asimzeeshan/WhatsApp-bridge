@@ -223,7 +223,7 @@ audio_dir = "./media/audio"
 [bridge.transcription]
 enabled = true
 whisper_url = "http://127.0.0.1:8443/inference"
-model = "large-v3-turbo"
+model = "large-v3"
 language = ""  # empty = auto-detect
 ```
 

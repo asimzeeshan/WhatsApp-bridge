@@ -30,21 +30,69 @@ type Message struct {
 }
 
 func (db *DB) UpsertMessage(m *Message) {
+	// messages holds only non-media fields - all media identification, decryption
+	// material, download lifecycle, and transcription live in messages_media.
 	db.Exec(`
 		INSERT INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-			media_type, mime_type, filename, media_key, file_sha256, file_enc_sha256, file_length,
-			media_url, direct_path, push_name, quoted_message_id, quoted_participant)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			push_name, quoted_message_id, quoted_participant)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
 			content=excluded.content, sender_name=excluded.sender_name,
-			push_name=excluded.push_name, media_type=excluded.media_type,
-			mime_type=excluded.mime_type, filename=excluded.filename,
-			media_key=excluded.media_key, file_sha256=excluded.file_sha256,
-			file_enc_sha256=excluded.file_enc_sha256, file_length=excluded.file_length,
-			media_url=excluded.media_url, direct_path=excluded.direct_path`,
+			push_name=excluded.push_name`,
 		m.ID, m.ChatJID, m.Sender, m.SenderName, m.Content, m.Timestamp, m.IsFromMe,
-		m.MediaType, m.MimeType, m.Filename, m.MediaKey, m.FileSHA256, m.FileEncSHA256,
-		m.FileLength, m.MediaURL, m.DirectPath, m.PushName, m.QuotedMessageID, m.QuotedParticipant)
+		m.PushName, m.QuotedMessageID, m.QuotedParticipant)
+
+	// Media message? Mirror the identification/decryption fields into messages_media.
+	// Worker-owned fields (local_path, downloaded_at, transcription, transcribed_at,
+	// download_*) are preserved across re-ingests.
+	if m.MediaType != "" {
+		db.upsertMessageMedia(m)
+	}
+}
+
+// upsertMessageMedia writes the bridge-owned columns of messages_media. NULLIF
+// in the INSERT/UPDATE branch keeps semantic NULL ("unknown / empty") distinct
+// from later worker-set values.
+func (db *DB) upsertMessageMedia(m *Message) {
+	// nilBytes returns nil for zero-length byte slices so empty bytea round-trips as NULL.
+	nilBytes := func(b []byte) any {
+		if len(b) == 0 {
+			return nil
+		}
+		return b
+	}
+	// nilStr / nilInt mirror NULLIF behavior for empty inputs from whatsmeow.
+	nilStr := func(s string) any {
+		if s == "" {
+			return nil
+		}
+		return s
+	}
+	nilInt := func(i int64) any {
+		if i == 0 {
+			return nil
+		}
+		return i
+	}
+
+	db.Exec(`
+		INSERT INTO messages_media (
+			message_id, chat_jid, media_type, mime_type, filename, file_length,
+			media_key, file_sha256, file_enc_sha256, media_url, direct_path
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (message_id, chat_jid) DO UPDATE SET
+			media_type      = excluded.media_type,
+			mime_type       = excluded.mime_type,
+			filename        = excluded.filename,
+			file_length     = excluded.file_length,
+			media_key       = excluded.media_key,
+			file_sha256     = excluded.file_sha256,
+			file_enc_sha256 = excluded.file_enc_sha256,
+			media_url       = excluded.media_url,
+			direct_path     = excluded.direct_path`,
+		m.ID, m.ChatJID, m.MediaType, nilStr(m.MimeType), nilStr(m.Filename), nilInt(m.FileLength),
+		nilBytes(m.MediaKey), nilBytes(m.FileSHA256), nilBytes(m.FileEncSHA256),
+		nilStr(m.MediaURL), nilStr(m.DirectPath))
 }
 
 type MessageQuery struct {
@@ -65,27 +113,29 @@ func (db *DB) QueryMessages(q MessageQuery) ([]Message, int, error) {
 		q.Limit = 500
 	}
 
+	// All filters reference columns on messages; qualify with `m.` so they stay
+	// unambiguous after the LEFT JOIN to messages_media below.
 	where := []string{"1=1"}
 	args := []any{}
 
 	if q.ChatJID != "" {
-		where = append(where, "chat_jid = ?")
+		where = append(where, "m.chat_jid = ?")
 		args = append(args, q.ChatJID)
 	}
 	if q.Sender != "" {
-		where = append(where, "sender = ?")
+		where = append(where, "m.sender = ?")
 		args = append(args, q.Sender)
 	}
 	if q.After > 0 {
-		where = append(where, "timestamp > ?")
+		where = append(where, "m.timestamp > ?")
 		args = append(args, q.After)
 	}
 	if q.Before > 0 {
-		where = append(where, "timestamp < ?")
+		where = append(where, "m.timestamp < ?")
 		args = append(args, q.Before)
 	}
 	if q.Query != "" {
-		where = append(where, "content LIKE ?")
+		where = append(where, "m.content LIKE ?")
 		args = append(args, "%"+q.Query+"%")
 	}
 
@@ -93,16 +143,20 @@ func (db *DB) QueryMessages(q MessageQuery) ([]Message, int, error) {
 
 	// Count
 	var total int
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM messages WHERE %s", whereClause)
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM messages m WHERE %s", whereClause)
 	if err := db.QueryRow(countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count messages: %w", err)
 	}
 
-	// Fetch
-	selectQuery := fmt.Sprintf(`SELECT id, chat_jid, sender, sender_name, content, timestamp,
-		is_from_me, media_type, mime_type, filename, file_length, push_name,
-		quoted_message_id, quoted_participant
-		FROM messages WHERE %s ORDER BY timestamp DESC LIMIT ? OFFSET ?`, whereClause)
+	// Fetch — media columns come from messages_media (LEFT JOIN keeps non-media rows).
+	selectQuery := fmt.Sprintf(`SELECT m.id, m.chat_jid, m.sender, m.sender_name, m.content, m.timestamp,
+		m.is_from_me, COALESCE(mm.media_type,'') AS media_type,
+		COALESCE(mm.mime_type,'') AS mime_type, COALESCE(mm.filename,'') AS filename,
+		COALESCE(mm.file_length,0) AS file_length, m.push_name,
+		m.quoted_message_id, m.quoted_participant
+		FROM messages m
+		LEFT JOIN messages_media mm ON mm.message_id = m.id AND mm.chat_jid = m.chat_jid
+		WHERE %s ORDER BY m.timestamp DESC LIMIT ? OFFSET ?`, whereClause)
 
 	args = append(args, q.Limit, q.Offset)
 	rows, err := db.Query(selectQuery, args...)
@@ -132,11 +186,15 @@ func (db *DB) GetMessageContext(id, chatJID string, context int) ([]Message, err
 	// context is in minutes, timestamps are in milliseconds
 	windowMs := int64(context) * 60 * 1000
 	rows, err := db.Query(`
-		SELECT id, chat_jid, sender, sender_name, content, timestamp,
-			is_from_me, media_type, mime_type, filename, file_length, push_name,
-			quoted_message_id, quoted_participant
-		FROM messages WHERE chat_jid = ? AND timestamp BETWEEN ? AND ?
-		ORDER BY timestamp ASC`,
+		SELECT m.id, m.chat_jid, m.sender, m.sender_name, m.content, m.timestamp,
+			m.is_from_me, COALESCE(mm.media_type,'') AS media_type,
+			COALESCE(mm.mime_type,'') AS mime_type, COALESCE(mm.filename,'') AS filename,
+			COALESCE(mm.file_length,0) AS file_length, m.push_name,
+			m.quoted_message_id, m.quoted_participant
+		FROM messages m
+		LEFT JOIN messages_media mm ON mm.message_id = m.id AND mm.chat_jid = m.chat_jid
+		WHERE m.chat_jid = ? AND m.timestamp BETWEEN ? AND ?
+		ORDER BY m.timestamp ASC`,
 		chatJID, ts-windowMs, ts+windowMs)
 	if err != nil {
 		return nil, fmt.Errorf("query context: %w", err)
@@ -168,12 +226,15 @@ func (db *DB) CheckNewMessages(jid string, limit int) ([]Message, error) {
 
 	// Query messages after watermark
 	rows, err := db.Query(`
-		SELECT id, chat_jid, sender, sender_name, content, timestamp,
-			is_from_me, media_type, mime_type, filename, file_length, push_name,
-			quoted_message_id, quoted_participant
-		FROM messages
-		WHERE chat_jid = ? AND timestamp > ? AND is_from_me = FALSE
-		ORDER BY timestamp ASC LIMIT ?`,
+		SELECT m.id, m.chat_jid, m.sender, m.sender_name, m.content, m.timestamp,
+			m.is_from_me, COALESCE(mm.media_type,'') AS media_type,
+			COALESCE(mm.mime_type,'') AS mime_type, COALESCE(mm.filename,'') AS filename,
+			COALESCE(mm.file_length,0) AS file_length, m.push_name,
+			m.quoted_message_id, m.quoted_participant
+		FROM messages m
+		LEFT JOIN messages_media mm ON mm.message_id = m.id AND mm.chat_jid = m.chat_jid
+		WHERE m.chat_jid = ? AND m.timestamp > ? AND m.is_from_me = FALSE
+		ORDER BY m.timestamp ASC LIMIT ?`,
 		jid, watermark, limit)
 	if err != nil {
 		return nil, fmt.Errorf("check new: %w", err)
@@ -269,12 +330,15 @@ func (db *DB) CheckTriggersMulti(jids []string, filters TriggerFilters, limit in
 	for _, jid := range jids {
 		wm := watermarks[jid]
 
-		queryStr := `SELECT id, chat_jid, sender, sender_name, content, timestamp,
-			is_from_me, media_type, mime_type, filename, file_length, push_name,
-			quoted_message_id, quoted_participant
-			FROM messages
-			WHERE chat_jid = ? AND timestamp > ? AND is_from_me = FALSE
-			ORDER BY timestamp ASC LIMIT ?`
+		queryStr := `SELECT m.id, m.chat_jid, m.sender, m.sender_name, m.content, m.timestamp,
+			m.is_from_me, COALESCE(mm.media_type,'') AS media_type,
+			COALESCE(mm.mime_type,'') AS mime_type, COALESCE(mm.filename,'') AS filename,
+			COALESCE(mm.file_length,0) AS file_length, m.push_name,
+			m.quoted_message_id, m.quoted_participant
+			FROM messages m
+			LEFT JOIN messages_media mm ON mm.message_id = m.id AND mm.chat_jid = m.chat_jid
+			WHERE m.chat_jid = ? AND m.timestamp > ? AND m.is_from_me = FALSE
+			ORDER BY m.timestamp ASC LIMIT ?`
 
 		msgRows, err := db.Query(queryStr, jid, wm, limit)
 		if err != nil {
@@ -308,13 +372,20 @@ func (db *DB) CheckTriggersMulti(jids []string, filters TriggerFilters, limit in
 }
 
 // GetMessageByID retrieves a single message including media_key fields (for download).
+// All media-related columns come from messages_media; LEFT JOIN preserves non-media rows.
 func (db *DB) GetMessageByID(id, chatJID string) (*Message, error) {
 	row := db.QueryRow(`
-		SELECT id, chat_jid, sender, sender_name, content, timestamp,
-			is_from_me, media_type, mime_type, filename, media_key, file_sha256,
-			file_enc_sha256, file_length, media_url, direct_path,
-			push_name, quoted_message_id, quoted_participant
-		FROM messages WHERE id = ? AND chat_jid = ?`, id, chatJID)
+		SELECT m.id, m.chat_jid, m.sender, m.sender_name, m.content, m.timestamp,
+			m.is_from_me, COALESCE(mm.media_type,'') AS media_type,
+			COALESCE(mm.mime_type,'') AS mime_type, COALESCE(mm.filename,'') AS filename,
+			mm.media_key, mm.file_sha256, mm.file_enc_sha256,
+			COALESCE(mm.file_length,0) AS file_length,
+			COALESCE(mm.media_url,'') AS media_url,
+			COALESCE(mm.direct_path,'') AS direct_path,
+			m.push_name, m.quoted_message_id, m.quoted_participant
+		FROM messages m
+		LEFT JOIN messages_media mm ON mm.message_id = m.id AND mm.chat_jid = m.chat_jid
+		WHERE m.id = ? AND m.chat_jid = ?`, id, chatJID)
 
 	m := &Message{}
 	err := row.Scan(&m.ID, &m.ChatJID, &m.Sender, &m.SenderName, &m.Content, &m.Timestamp,
@@ -333,21 +404,33 @@ func (db *DB) GetMessageByID(id, chatJID string) (*Message, error) {
 // MarkRevoked marks a message as revoked (deleted for everyone).
 func (db *DB) MarkRevoked(id, chatJID string) {
 	db.Exec(
-		"UPDATE messages SET is_revoked = 1 WHERE id = ? AND chat_jid = ?",
+		"UPDATE messages SET is_revoked = true WHERE id = ? AND chat_jid = ?",
 		id, chatJID)
 }
 
 // UpdateLocalPath stores the local file path for a downloaded media file.
 func (db *DB) UpdateLocalPath(id, chatJID, localPath string) {
+	if localPath == "" {
+		return
+	}
 	db.Exec(
-		"UPDATE messages SET local_path = ? WHERE id = ? AND chat_jid = ?",
+		`UPDATE messages_media SET local_path = ?, downloaded_at = NOW()
+		 WHERE message_id = ? AND chat_jid = ?`,
 		localPath, id, chatJID)
+}
+
+// UpdateTranscription stores the Whisper transcription for an audio message.
+func (db *DB) UpdateTranscription(id, chatJID, text string) {
+	db.Exec(
+		`UPDATE messages_media SET transcription = ?, transcribed_at = NOW()
+		 WHERE message_id = ? AND chat_jid = ?`,
+		text, id, chatJID)
 }
 
 // UpdateEditedContent updates a message's content after an edit.
 func (db *DB) UpdateEditedContent(id, chatJID, newContent string) {
 	db.Exec(
-		"UPDATE messages SET content = ?, is_edited = 1, edited_at = ? WHERE id = ? AND chat_jid = ?",
+		"UPDATE messages SET content = ?, is_edited = true, edited_at = ? WHERE id = ? AND chat_jid = ?",
 		newContent, time.Now().UnixMilli(), id, chatJID)
 }
 

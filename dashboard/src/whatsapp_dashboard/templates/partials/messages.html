@@ -24,7 +24,7 @@
                 <span class="ts">text</span>
                 {% endif %}
             </td>
-            <td class="ts">{{ m.timestamp }}</td>
+            <td class="ts">{{ m.time_fmt or m.timestamp }}</td>
         </tr>
         {% endfor %}
         {% if not recent_messages %}

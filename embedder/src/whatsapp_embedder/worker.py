@@ -161,6 +161,20 @@ def run_loop(pg_dsn: str, model_name: str, batch_size: int, poll_interval: int):
 
     while running:
         try:
+            # Media-only / revoked messages have no text to embed but were left in
+            # the 'unembedded' pool forever, causing supervisor alerts. Mark them
+            # as embedded so they exit the pool; the embedding row stays absent
+            # (which is correct - they have nothing to embed).
+            with pg_conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE messages SET embedded_at = NOW()
+                    WHERE embedded_at IS NULL
+                      AND (content = '' OR is_revoked = TRUE)
+                """)
+                if cur.rowcount:
+                    logger.info("marked %d empty/revoked messages as embedded (skipped)", cur.rowcount)
+            pg_conn.commit()
+
             messages = fetch_unembedded(pg_conn, batch_size)
             if messages:
                 embed_batch(model, pg_conn, messages)

@@ -10,15 +10,45 @@ import (
 	"sync"
 	"time"
 
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 
 	"github.com/asimzeeshan/WhatsApp-bridge/bridge/indexer"
+	"github.com/asimzeeshan/WhatsApp-bridge/bridge/mediaretry"
 	"github.com/asimzeeshan/WhatsApp-bridge/bridge/store"
 )
 
 // rawLogMu protects concurrent writes to the raw log file.
 var rawLogMu sync.Mutex
+
+// resolveToPhone converts a JID string to phone format if it's an LID.
+// Device suffixes (e.g. :75) are stripped. Returns the original JID if it's
+// already phone format or if the LID cannot be resolved.
+func (b *Bridge) resolveToPhone(jid string) string {
+	if !strings.HasSuffix(jid, "@lid") || b.waClient == nil || b.waClient.Store == nil {
+		return jid
+	}
+	// Strip device suffix (e.g. "100000000000000:90@lid" -> "100000000000000@lid")
+	clean := jid
+	if atIdx := strings.Index(clean, "@"); atIdx > 0 {
+		user := clean[:atIdx]
+		if colonIdx := strings.Index(user, ":"); colonIdx > 0 {
+			user = user[:colonIdx]
+		}
+		clean = user + "@lid"
+	}
+	parsed, err := types.ParseJID(clean)
+	if err != nil {
+		return jid
+	}
+	pn, err := b.waClient.Store.LIDs.GetPNForLID(context.Background(), parsed)
+	if err != nil || pn.IsEmpty() {
+		return jid
+	}
+	return pn.String()
+}
 
 // dumpRawMessage appends the full message event as a JSON line to logs/raw/YYYY-MM-DD.jsonl.
 func dumpRawMessage(dataDir string, evt *events.Message) {
@@ -88,7 +118,39 @@ func (b *Bridge) handleEvent(evt interface{}) {
 		b.Logger.Warn("stream replaced by another connection")
 	case *events.KeepAliveTimeout:
 		b.Logger.Warn("keepalive timeout", "error_count", v.ErrorCount)
+	case *events.MediaRetry:
+		b.handleMediaRetry(v)
 	}
+}
+
+// handleMediaRetry receives the sender's re-upload response (triggered by a
+// SendMediaRetryReceipt from the download handler), decrypts it to recover the
+// fresh direct path, and hands it to the waiting download request via the
+// mediaretry coordinator. Any failure is delivered as an error so the waiter
+// falls back to the original download error.
+func (b *Bridge) handleMediaRetry(evt *events.MediaRetry) {
+	msgID := evt.MessageID
+	if evt.Error != nil {
+		mediaretry.Deliver(msgID, mediaretry.Result{Err: fmt.Errorf("media retry rejected by sender")})
+		return
+	}
+	msg, err := b.DB.GetMessageByID(msgID, evt.ChatID.String())
+	if err != nil || msg == nil || len(msg.MediaKey) == 0 {
+		mediaretry.Deliver(msgID, mediaretry.Result{Err: fmt.Errorf("media retry: message or media key not found")})
+		return
+	}
+	notif, err := whatsmeow.DecryptMediaRetryNotification(evt, msg.MediaKey)
+	if err != nil {
+		mediaretry.Deliver(msgID, mediaretry.Result{Err: err})
+		return
+	}
+	dp := notif.GetDirectPath()
+	if dp == "" {
+		mediaretry.Deliver(msgID, mediaretry.Result{Err: fmt.Errorf("media retry: empty direct path (result=%v)", notif.GetResult())})
+		return
+	}
+	b.Logger.Info("media re-uploaded by sender", "msg_id", msgID)
+	mediaretry.Deliver(msgID, mediaretry.Result{DirectPath: dp})
 }
 
 func (b *Bridge) handleMessage(evt *events.Message) {
@@ -96,7 +158,7 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	go dumpRawMessage(b.Cfg.Bridge.DataDir, evt)
 
 	chatJID := evt.Info.Chat.String()
-	senderJID := evt.Info.Sender.String()
+	senderJID := b.resolveToPhone(evt.Info.Sender.String())
 	senderName := evt.Info.PushName
 	timestamp := evt.Info.Timestamp.UnixMilli()
 	isFromMe := evt.Info.IsFromMe
@@ -153,6 +215,54 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 		return // reactions are not messages - don't store in messages table
 	}
 
+	// Handle poll creation (all versions share the same PollCreationMessage type)
+	if poll := firstPollCreation(evt); poll != nil {
+		options := make([]store.PollOption, len(poll.GetOptions()))
+		for i, opt := range poll.GetOptions() {
+			options[i] = store.PollOption{Name: opt.GetOptionName()}
+		}
+		b.DB.UpsertPoll(&store.Poll{
+			MessageID:     evt.Info.ID,
+			ChatJID:       chatJID,
+			Creator:       senderJID,
+			Question:      poll.GetName(),
+			Options:       options,
+			MaxSelections: int(poll.GetSelectableOptionsCount()),
+			EncKey:        poll.GetEncKey(),
+			CreatedAt:     timestamp,
+		})
+		b.Logger.Debug("poll created", "question", poll.GetName(), "options", len(options), "from", senderName)
+		// Don't return - let the message also be stored with content = poll question
+	}
+
+	// Handle poll votes
+	if pollUpdate := evt.Message.GetPollUpdateMessage(); pollUpdate != nil {
+		decrypted, err := b.waClient.DecryptPollVote(context.Background(), evt)
+		if err == nil {
+			pollKey := pollUpdate.GetPollCreationMessageKey()
+			pollID := pollKey.GetID()
+
+			poll, err := b.DB.GetPoll(pollID, chatJID)
+			if err == nil && poll != nil {
+				selected := store.ResolveVoteHashes(decrypted.GetSelectedOptions(), poll.Options)
+				b.DB.UpsertPollVote(&store.PollVote{
+					PollMessageID:   pollID,
+					ChatJID:         chatJID,
+					Voter:           senderJID,
+					VoterName:       senderName,
+					SelectedOptions: selected,
+					VotedAt:         timestamp,
+				})
+				b.Logger.Debug("poll vote", "poll", pollID, "voter", senderName, "selected", selected)
+			} else if err != nil {
+				b.Logger.Warn("poll vote lookup failed", "error", err, "poll_id", pollID)
+			}
+		} else {
+			b.Logger.Warn("poll vote decrypt failed", "error", err, "msg_id", evt.Info.ID)
+		}
+		// Don't return - let it also be stored as a regular message
+	}
+
 	// Extract text content
 	content := extractText(evt)
 
@@ -166,7 +276,8 @@ func (b *Bridge) handleMessage(evt *events.Message) {
 	}
 
 	// Extract quoted message info
-	quotedID, quotedParticipant := extractQuoteInfo(evt)
+	quotedID, quotedParticipantRaw := extractQuoteInfo(evt)
+	quotedParticipant := b.resolveToPhone(quotedParticipantRaw)
 
 	msg := &store.Message{
 		ID:                evt.Info.ID,
@@ -324,7 +435,7 @@ func (b *Bridge) handleHistorySync(evt *events.HistorySync) {
 
 			info := wm.GetMessage()
 			ts := int64(wm.GetMessageTimestamp()) * 1000 // Convert to ms
-			sender := wm.GetParticipant()
+			sender := b.resolveToPhone(wm.GetParticipant())
 			if sender == "" {
 				key := wm.GetKey()
 				if key != nil && key.GetFromMe() {
@@ -585,12 +696,8 @@ func (b *Bridge) transcribeAudio(evt *events.Message) {
 	}
 
 	if text != "" {
-		// Store transcription in separate column (preserves original content)
 		chatJID := evt.Info.Chat.String()
-		b.DB.Writer.Enqueue(
-			"UPDATE messages SET transcription = ? WHERE id = ? AND chat_jid = ?",
-			text, evt.Info.ID, chatJID,
-		)
+		b.DB.UpdateTranscription(evt.Info.ID, chatJID, text)
 		b.Logger.Info("transcribed voice note", "msg_id", evt.Info.ID, "text_length", len(text))
 	}
 }
@@ -604,6 +711,32 @@ func (b *Bridge) downloadMedia(evt *events.Message) ([]byte, error) {
 		return nil, fmt.Errorf("message has no image")
 	}
 	return b.waClient.Download(context.Background(), img)
+}
+
+// firstPollCreation returns the first non-nil PollCreationMessage across all
+// versioned fields (v1 through v6, skipping v4 which is a FutureProofMessage).
+func firstPollCreation(evt *events.Message) *waE2E.PollCreationMessage {
+	msg := evt.Message
+	if msg == nil {
+		return nil
+	}
+	if p := msg.GetPollCreationMessage(); p != nil {
+		return p
+	}
+	if p := msg.GetPollCreationMessageV2(); p != nil {
+		return p
+	}
+	if p := msg.GetPollCreationMessageV3(); p != nil {
+		return p
+	}
+	// V4 is FutureProofMessage - skip
+	if p := msg.GetPollCreationMessageV5(); p != nil {
+		return p
+	}
+	if p := msg.GetPollCreationMessageV6(); p != nil {
+		return p
+	}
+	return nil
 }
 
 func extractText(evt *events.Message) string {
@@ -625,6 +758,10 @@ func extractText(evt *events.Message) string {
 	}
 	if msg.GetDocumentMessage() != nil && msg.GetDocumentMessage().GetCaption() != "" {
 		return msg.GetDocumentMessage().GetCaption()
+	}
+	// Poll creation - store the question as content
+	if p := firstPollCreation(evt); p != nil && p.GetName() != "" {
+		return p.GetName()
 	}
 	return ""
 }

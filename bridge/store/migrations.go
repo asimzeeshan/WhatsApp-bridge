@@ -129,4 +129,120 @@ var migrations = []string{
 
 	// v10: local file path for downloaded media
 	`ALTER TABLE messages ADD COLUMN local_path TEXT NOT NULL DEFAULT '';`,
+
+	// v11: messages_media - normalized home for every media-related concern.
+	// Mirrors the PostgreSQL version (see migrations_pg.go); SQLite uses BLOB instead
+	// of BYTEA and TEXT instead of TIMESTAMPTZ. Same logical shape and constraints.
+	`CREATE TABLE IF NOT EXISTS messages_media (
+		message_id                  TEXT        NOT NULL,
+		chat_jid                    TEXT        NOT NULL,
+
+		media_type                  TEXT        NOT NULL CHECK (media_type IN ('image','video','audio','sticker','document')),
+		mime_type                   TEXT,
+		filename                    TEXT,
+		file_length                 INTEGER,
+
+		media_key                   BLOB,
+		file_sha256                 BLOB,
+		file_enc_sha256             BLOB,
+		media_url                   TEXT,
+		direct_path                 TEXT,
+
+		local_path                  TEXT,
+		downloaded_at               TEXT,
+		download_attempts           INTEGER     NOT NULL DEFAULT 0,
+		download_last_error         TEXT,
+		download_last_attempt_at    TEXT,
+		download_permanently_failed INTEGER     NOT NULL DEFAULT 0,
+
+		transcription               TEXT,
+		transcribed_at              TEXT,
+
+		created_at                  TEXT        NOT NULL DEFAULT (datetime('now')),
+
+		PRIMARY KEY (message_id, chat_jid),
+		FOREIGN KEY (message_id, chat_jid) REFERENCES messages(id, chat_jid) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_mm_pending_download ON messages_media (created_at)
+		WHERE local_path IS NULL
+		  AND download_permanently_failed = 0
+		  AND media_type IN ('image','video','sticker','document');
+	CREATE INDEX IF NOT EXISTS idx_mm_pending_transcription ON messages_media (created_at)
+		WHERE transcribed_at IS NULL
+		  AND media_type = 'audio'
+		  AND local_path IS NOT NULL;
+	CREATE INDEX IF NOT EXISTS idx_mm_file_sha256 ON messages_media (file_sha256)
+		WHERE file_sha256 IS NOT NULL;`,
+
+	// v12: backfill messages_media from messages columns + media_download_state.
+	// Idempotent. NULLIF unwraps empty-string sentinels into semantic NULL.
+	// media_download_state is a downstream sidecar that may not exist in pure-OSS deployments;
+	// LEFT JOIN tolerates that.
+	`INSERT INTO messages_media (
+		message_id, chat_jid, media_type, mime_type, filename, file_length,
+		media_key, file_sha256, file_enc_sha256, media_url, direct_path,
+		local_path, downloaded_at,
+		download_attempts, download_last_error, download_last_attempt_at, download_permanently_failed,
+		transcription, transcribed_at,
+		created_at
+	)
+	SELECT
+		m.id, m.chat_jid, m.media_type,
+		NULLIF(m.mime_type, ''),
+		NULLIF(m.filename, ''),
+		NULLIF(m.file_length, 0),
+		m.media_key, m.file_sha256, m.file_enc_sha256,
+		NULLIF(m.media_url, ''),
+		NULLIF(m.direct_path, ''),
+		NULLIF(m.local_path, ''),
+		CASE WHEN m.local_path <> '' THEN datetime(m.timestamp / 1000, 'unixepoch') END,
+		0, NULL, NULL, 0,
+		NULLIF(m.transcription, ''),
+		CASE WHEN m.transcription <> '' THEN datetime(m.timestamp / 1000, 'unixepoch') END,
+		datetime(m.timestamp / 1000, 'unixepoch')
+	FROM messages m
+	WHERE m.media_type <> ''
+	ON CONFLICT (message_id, chat_jid) DO NOTHING;`,
+
+	// v13: drop legacy media columns from messages and the absorbed sidecar.
+	// SQLite supports ALTER TABLE DROP COLUMN since 3.35.0 (2021); pre-existing
+	// SQLite deployments may not have media_download_state at all (LEFT JOIN in v12
+	// tolerates that).
+	`DROP INDEX IF EXISTS idx_messages_missing_media;
+	ALTER TABLE messages DROP COLUMN media_type;
+	ALTER TABLE messages DROP COLUMN mime_type;
+	ALTER TABLE messages DROP COLUMN filename;
+	ALTER TABLE messages DROP COLUMN media_key;
+	ALTER TABLE messages DROP COLUMN file_sha256;
+	ALTER TABLE messages DROP COLUMN file_enc_sha256;
+	ALTER TABLE messages DROP COLUMN file_length;
+	ALTER TABLE messages DROP COLUMN media_url;
+	ALTER TABLE messages DROP COLUMN direct_path;
+	ALTER TABLE messages DROP COLUMN local_path;
+	ALTER TABLE messages DROP COLUMN transcription;
+	DROP TABLE IF EXISTS media_download_state;`,
+
+	// v14: polls and poll votes
+	`CREATE TABLE IF NOT EXISTS polls (
+		message_id     TEXT NOT NULL,
+		chat_jid       TEXT NOT NULL,
+		creator        TEXT NOT NULL DEFAULT '',
+		question       TEXT NOT NULL DEFAULT '',
+		options        TEXT NOT NULL DEFAULT '[]',
+		max_selections INTEGER NOT NULL DEFAULT 1,
+		enc_key        BLOB,
+		created_at     INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (message_id, chat_jid)
+	);
+
+	CREATE TABLE IF NOT EXISTS poll_votes (
+		poll_message_id  TEXT NOT NULL,
+		chat_jid         TEXT NOT NULL,
+		voter            TEXT NOT NULL,
+		voter_name       TEXT NOT NULL DEFAULT '',
+		selected_options TEXT NOT NULL DEFAULT '[]',
+		voted_at         INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (poll_message_id, chat_jid, voter)
+	);
+	CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes (poll_message_id, chat_jid);`,
 }

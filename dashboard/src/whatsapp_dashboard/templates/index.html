@@ -99,7 +99,7 @@
     <!-- Groups -->
     <div class="section">
         <div class="card card-full">
-            <h2>Monitored Groups</h2>
+            <h2>Monitored Groups ({{ watched_count }})</h2>
             <table>
                 <thead>
                     <tr>
@@ -171,7 +171,7 @@
                         <td class="truncate">{{ l.title or '-' }}</td>
                         <td class="ts">{{ l.sender_jid[:15] }}...</td>
                         <td>{{ l.chat_name or l.chat_jid[:15] }}</td>
-                        <td class="ts">{{ l.created_at or '-' }}</td>
+                        <td class="ts">{{ l.time_fmt or l.created_at or '-' }}</td>
                     </tr>
                     {% endfor %}
                     {% if not links %}
@@ -209,7 +209,7 @@
                             {% endif %}
                         </td>
                         <td class="truncate ts">{{ tc.error_msg or '-' }}</td>
-                        <td class="ts">{{ tc.called_at }}</td>
+                        <td class="ts">{{ tc.time_fmt or tc.called_at }}</td>
                     </tr>
                     {% endfor %}
                     {% if not tool_calls %}

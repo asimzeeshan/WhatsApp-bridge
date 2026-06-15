@@ -9,7 +9,7 @@ Usage:
 Environment variables (alternative to CLI args):
     PG_DSN - PostgreSQL connection string
     WHISPER_URL - Whisper API endpoint
-    WHISPER_MODEL - Model name (default: large-v3-turbo)
+    WHISPER_MODEL - Model name (default: large-v3)
     BRIDGE_URL - Bridge API for re-downloading media (default: http://127.0.0.1:8080)
     BATCH_SIZE - Messages per cycle (default: 20)
     POLL_INTERVAL - Seconds between polls (default: 30)
@@ -31,7 +31,7 @@ import psycopg2
 logger = logging.getLogger(__name__)
 
 DEFAULT_WHISPER_URL = "http://127.0.0.1:8443"
-DEFAULT_WHISPER_MODEL = "large-v3-turbo"
+DEFAULT_WHISPER_MODEL = "large-v3"
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:8080"
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_POLL_INTERVAL = 30
@@ -49,20 +49,53 @@ def handle_signal(signum, frame):
 
 
 def fetch_untranscribed(pg_conn, batch_size: int) -> list[dict]:
-    """Fetch audio messages that need transcription."""
+    """Fetch audio messages that need transcription.
+
+    Skips rows whose download has permanently failed - those are expired
+    WhatsApp media (>14 days old) that no number of retries will recover.
+    """
     with pg_conn.cursor() as cur:
         cur.execute("""
-            SELECT id, chat_jid, local_path, media_url, direct_path, file_length, mime_type
-            FROM messages
-            WHERE media_type = 'audio'
-              AND (transcription = '' OR transcription IS NULL)
-              AND is_revoked = FALSE
-            ORDER BY timestamp DESC
+            SELECT mm.message_id AS id, mm.chat_jid,
+                   mm.local_path, mm.media_url, mm.direct_path,
+                   mm.file_length, mm.mime_type
+            FROM messages_media mm
+            JOIN messages m ON m.id = mm.message_id AND m.chat_jid = mm.chat_jid
+            WHERE mm.media_type = 'audio'
+              AND mm.transcribed_at IS NULL
+              AND NOT mm.download_permanently_failed
+              AND m.is_revoked = FALSE
+            ORDER BY m.timestamp DESC
             LIMIT %s
         """, (batch_size,))
 
         columns = [desc[0] for desc in cur.description]
         return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def record_redownload_failure(pg_conn, msg_id: str, chat_jid: str, error_text: str):
+    """Bump download_attempts; flip permanent_failed once attempts >= 8 or on a
+    terminal HTTP code so we stop hammering bridge/WhatsApp for dead media."""
+    permanent_patterns = ("status code 403", "status code 404", "status code 410",
+                          "MISSING_MEDIA_INFO")
+    permanent = any(p in error_text for p in permanent_patterns)
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE messages_media SET
+                download_attempts = CASE WHEN %s THEN 8
+                                         ELSE download_attempts + 1 END,
+                download_last_attempt_at = NOW(),
+                download_last_error = LEFT(%s, 500),
+                download_permanently_failed = CASE
+                    WHEN %s THEN TRUE
+                    WHEN download_attempts + 1 >= 8 THEN TRUE
+                    ELSE download_permanently_failed END
+            WHERE message_id = %s AND chat_jid = %s
+            """,
+            (permanent, error_text or '', permanent, msg_id, chat_jid),
+        )
+    pg_conn.commit()
 
 
 def normalize_mime_type(mime_type: str | None) -> str:
@@ -134,7 +167,8 @@ def transcribe_file(file_path: str, whisper_url: str, model: str, mime_type: str
             resp = httpx.post(
                 f"{whisper_url}/inference",
                 files={"file": (os.path.basename(wav_path), f, "audio/wav")},
-                data={"temperature": "0.0", "response_format": "json"},
+                data={"temperature": "0.0", "response_format": "json",
+                      "language": os.environ.get("WHISPER_LANGUAGE", "ur")},
                 timeout=120.0,
             )
             resp.raise_for_status()
@@ -148,8 +182,14 @@ def transcribe_file(file_path: str, whisper_url: str, model: str, mime_type: str
             os.unlink(wav_path)
 
 
-def redownload_audio(msg_id: str, chat_jid: str, bridge_url: str, output_dir: str) -> str | None:
-    """Re-download audio via bridge API if local file is missing."""
+def redownload_audio(msg_id: str, chat_jid: str, bridge_url: str, output_dir: str) -> tuple[str | None, str]:
+    """Re-download audio via bridge API if local file is missing.
+
+    Returns (file_path, error_text). On success: ("/some/path", "").
+    On failure: (None, "<error string>"). The error text is fed to
+    record_redownload_failure so we can flip download_permanently_failed
+    on terminal HTTP codes (403/404/410) and stop hammering dead media.
+    """
     try:
         os.makedirs(output_dir, exist_ok=True)
         resp = httpx.post(
@@ -157,29 +197,38 @@ def redownload_audio(msg_id: str, chat_jid: str, bridge_url: str, output_dir: st
             json={"message_id": msg_id, "chat_jid": chat_jid, "output_dir": output_dir},
             timeout=60.0,
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # Surface the bridge's response body - it contains the WhatsApp HTTP code
+            # we use to classify permanent failures.
+            try:
+                body = resp.json()
+                err = f"HTTP {resp.status_code}: {body}"
+            except Exception:
+                err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            return (None, err)
         data = resp.json()
-        return data.get("file_path")
+        return (data.get("file_path"), "")
     except Exception as e:
-        logger.warning("re-download failed for %s: %s", msg_id, e)
-        return None
+        return (None, f"request_error: {e}")
 
 
 def update_transcription(pg_conn, msg_id: str, chat_jid: str, text: str):
-    """Update the transcription column in PostgreSQL."""
+    """Write transcription back to messages_media."""
     with pg_conn.cursor() as cur:
         cur.execute(
-            "UPDATE messages SET transcription = %s WHERE id = %s AND chat_jid = %s",
+            """UPDATE messages_media SET transcription = %s, transcribed_at = NOW()
+               WHERE message_id = %s AND chat_jid = %s""",
             (text, msg_id, chat_jid),
         )
     pg_conn.commit()
 
 
 def update_local_path(pg_conn, msg_id: str, chat_jid: str, local_path: str):
-    """Update local_path if we re-downloaded the file."""
+    """After a successful re-download, persist the new path."""
     with pg_conn.cursor() as cur:
         cur.execute(
-            "UPDATE messages SET local_path = %s WHERE id = %s AND chat_jid = %s",
+            """UPDATE messages_media SET local_path = %s, downloaded_at = NOW()
+               WHERE message_id = %s AND chat_jid = %s""",
             (local_path, msg_id, chat_jid),
         )
     pg_conn.commit()
@@ -233,11 +282,14 @@ def run_loop(pg_dsn: str, whisper_url: str, model: str, bridge_url: str,
                 # Try local file first
                 if not local_path or not os.path.isfile(local_path):
                     # Re-download via bridge API
-                    local_path = redownload_audio(msg_id, chat_jid, bridge_url, redownload_dir)
-                    if local_path:
+                    new_path, err = redownload_audio(msg_id, chat_jid, bridge_url, redownload_dir)
+                    if new_path:
+                        local_path = new_path
                         update_local_path(pg_conn, msg_id, chat_jid, local_path)
                     else:
-                        logger.debug("skip %s - no local file and re-download failed", msg_id)
+                        # Record so we stop re-trying dead media every cycle
+                        record_redownload_failure(pg_conn, msg_id, chat_jid, err)
+                        logger.debug("skip %s - re-download failed: %s", msg_id, err)
                         failed += 1
                         continue
 

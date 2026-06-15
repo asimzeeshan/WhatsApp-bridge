@@ -33,3 +33,8 @@ dist/
 
 # OS
 .DS_Store
+
+# never commit agent task specs or secrets
+AGENTS.md
+.env
+config.toml

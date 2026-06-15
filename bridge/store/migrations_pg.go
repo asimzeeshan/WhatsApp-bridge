@@ -130,4 +130,130 @@ var pgMigrations = []string{
 
 	// v10: local file path for downloaded media
 	`ALTER TABLE messages ADD COLUMN IF NOT EXISTS local_path TEXT NOT NULL DEFAULT '';`,
+
+	// v11: messages_media - one normalized home for every media-related concern.
+	// Folds in what used to live across messages columns + media_download_state sidecar:
+	//   - identification (media_type, mime_type, filename, file_length)
+	//   - decryption / re-download material (media_key, *_sha256, media_url, direct_path)
+	//   - download lifecycle (local_path, downloaded_at, attempts, errors, permanent failure)
+	//   - transcription lifecycle (transcription, transcribed_at)
+	// NULL semantics throughout: NULL = never attempted; empty string / '[silence]' = attempted, empty result.
+	`CREATE TABLE IF NOT EXISTS messages_media (
+		message_id                  TEXT        NOT NULL,
+		chat_jid                    TEXT        NOT NULL,
+
+		media_type                  TEXT        NOT NULL CHECK (media_type IN ('image','video','audio','sticker','document')),
+		mime_type                   TEXT,
+		filename                    TEXT,
+		file_length                 BIGINT,
+
+		media_key                   BYTEA,
+		file_sha256                 BYTEA,
+		file_enc_sha256             BYTEA,
+		media_url                   TEXT,
+		direct_path                 TEXT,
+
+		local_path                  TEXT,
+		downloaded_at               TIMESTAMPTZ,
+		download_attempts           INTEGER     NOT NULL DEFAULT 0,
+		download_last_error         TEXT,
+		download_last_attempt_at    TIMESTAMPTZ,
+		download_permanently_failed BOOLEAN     NOT NULL DEFAULT FALSE,
+
+		transcription               TEXT,
+		transcribed_at              TIMESTAMPTZ,
+
+		created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+		PRIMARY KEY (message_id, chat_jid),
+		FOREIGN KEY (message_id, chat_jid) REFERENCES messages(id, chat_jid) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_mm_pending_download ON messages_media (created_at)
+		WHERE local_path IS NULL
+		  AND NOT download_permanently_failed
+		  AND media_type IN ('image','video','sticker','document');
+	CREATE INDEX IF NOT EXISTS idx_mm_pending_transcription ON messages_media (created_at)
+		WHERE transcribed_at IS NULL
+		  AND media_type = 'audio'
+		  AND local_path IS NOT NULL;
+	CREATE INDEX IF NOT EXISTS idx_mm_file_sha256 ON messages_media (file_sha256)
+		WHERE file_sha256 IS NOT NULL;`,
+
+	// v12: backfill messages_media from the existing messages columns + media_download_state.
+	// Idempotent (ON CONFLICT DO NOTHING) so it can be re-run safely.
+	// Empty strings / zero-length bytea -> NULL (semantic NULL = "never attempted/unknown").
+	// For historical rows the created_at proxy is the original message timestamp.
+	`INSERT INTO messages_media (
+		message_id, chat_jid, media_type, mime_type, filename, file_length,
+		media_key, file_sha256, file_enc_sha256, media_url, direct_path,
+		local_path, downloaded_at,
+		download_attempts, download_last_error, download_last_attempt_at, download_permanently_failed,
+		transcription, transcribed_at,
+		created_at
+	)
+	SELECT
+		m.id, m.chat_jid, m.media_type,
+		NULLIF(m.mime_type, ''),
+		NULLIF(m.filename, ''),
+		NULLIF(m.file_length, 0),
+		NULLIF(m.media_key, ''::bytea),
+		NULLIF(m.file_sha256, ''::bytea),
+		NULLIF(m.file_enc_sha256, ''::bytea),
+		NULLIF(m.media_url, ''),
+		NULLIF(m.direct_path, ''),
+		NULLIF(m.local_path, ''),
+		CASE WHEN m.local_path <> '' THEN to_timestamp(m.timestamp / 1000.0) END,
+		COALESCE(s.attempts, 0),
+		NULLIF(s.last_error, ''),
+		s.last_attempt_at,
+		COALESCE(s.attempts >= 8, FALSE),
+		NULLIF(m.transcription, ''),
+		CASE WHEN m.transcription <> '' THEN to_timestamp(m.timestamp / 1000.0) END,
+		to_timestamp(m.timestamp / 1000.0)
+	FROM messages m
+	LEFT JOIN media_download_state s ON s.message_id = m.id AND s.chat_jid = m.chat_jid
+	WHERE m.media_type <> ''
+	ON CONFLICT (message_id, chat_jid) DO NOTHING;`,
+
+	// v13: legacy media columns and sidecar are no longer written by any code path.
+	// Drop them; the partial index on messages.media_type is dropped along with the
+	// column it depends on. media_download_state was absorbed by messages_media in v11/v12.
+	`DROP INDEX IF EXISTS idx_messages_missing_media;
+	ALTER TABLE messages
+		DROP COLUMN IF EXISTS media_type,
+		DROP COLUMN IF EXISTS mime_type,
+		DROP COLUMN IF EXISTS filename,
+		DROP COLUMN IF EXISTS media_key,
+		DROP COLUMN IF EXISTS file_sha256,
+		DROP COLUMN IF EXISTS file_enc_sha256,
+		DROP COLUMN IF EXISTS file_length,
+		DROP COLUMN IF EXISTS media_url,
+		DROP COLUMN IF EXISTS direct_path,
+		DROP COLUMN IF EXISTS local_path,
+		DROP COLUMN IF EXISTS transcription;
+	DROP TABLE IF EXISTS media_download_state;`,
+
+	// v14: polls and poll votes
+	`CREATE TABLE IF NOT EXISTS polls (
+		message_id     TEXT NOT NULL,
+		chat_jid       TEXT NOT NULL,
+		creator        TEXT NOT NULL DEFAULT '',
+		question       TEXT NOT NULL DEFAULT '',
+		options        JSONB NOT NULL DEFAULT '[]',
+		max_selections INTEGER NOT NULL DEFAULT 1,
+		enc_key        BYTEA,
+		created_at     BIGINT NOT NULL DEFAULT 0,
+		PRIMARY KEY (message_id, chat_jid)
+	);
+
+	CREATE TABLE IF NOT EXISTS poll_votes (
+		poll_message_id  TEXT NOT NULL,
+		chat_jid         TEXT NOT NULL,
+		voter            TEXT NOT NULL,
+		voter_name       TEXT NOT NULL DEFAULT '',
+		selected_options JSONB NOT NULL DEFAULT '[]',
+		voted_at         BIGINT NOT NULL DEFAULT 0,
+		PRIMARY KEY (poll_message_id, chat_jid, voter)
+	);
+	CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes (poll_message_id, chat_jid);`,
 }

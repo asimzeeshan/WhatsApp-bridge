@@ -3,18 +3,69 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/asimzeeshan/WhatsApp-bridge/bridge/media"
+	"github.com/asimzeeshan/WhatsApp-bridge/bridge/store"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
 )
+
+// persistOutgoing writes a successful outbound send into the messages and chats
+// tables so the bot's own activity is fully visible in postgres alongside inbound
+// traffic. WhatsApp does not always echo our own messages back as events, so
+// without this the leaderboards, gap audits, and any "what did I send" query
+// would underreport. Errors are swallowed; persistence is best-effort and must
+// never fail the user-visible send response.
+func (s *Server) persistOutgoing(chatJID, messageID, content, mediaType, mimeType, filename string, fileLength int64, quotedMessageID, quotedParticipant string, ts time.Time) {
+	if s.connMgr.Client == nil || s.connMgr.Client.Store == nil || s.connMgr.Client.Store.ID == nil {
+		return
+	}
+	selfID := s.connMgr.Client.Store.ID
+	pushName := s.connMgr.Client.Store.PushName
+
+	preview := content
+	if preview == "" && mediaType != "" {
+		preview = fmt.Sprintf("[%s]", mediaType)
+	}
+	if len(preview) > 100 {
+		preview = preview[:100]
+	}
+
+	tsMS := ts.UnixMilli()
+	s.db.UpsertMessage(&store.Message{
+		ID:                messageID,
+		ChatJID:           chatJID,
+		Sender:            selfID.String(),
+		SenderName:        pushName,
+		Content:           content,
+		Timestamp:         tsMS,
+		IsFromMe:          true,
+		MediaType:         mediaType,
+		MimeType:          mimeType,
+		Filename:          filename,
+		FileLength:        fileLength,
+		PushName:          pushName,
+		QuotedMessageID:   quotedMessageID,
+		QuotedParticipant: quotedParticipant,
+	})
+
+	isGroup := strings.HasSuffix(chatJID, "@g.us")
+	s.db.UpsertChat(&store.Chat{
+		JID:                chatJID,
+		IsGroup:            isGroup,
+		LastMessageTime:    fmt.Sprintf("%d", tsMS),
+		LastMessagePreview: preview,
+	})
+}
 
 // getEphemeralExpiry checks if a group has disappearing messages enabled and
 // returns the timer in seconds (e.g. 86400 for 24h, 604800 for 7d). Returns 0
@@ -106,19 +157,26 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Handle mentions
+	// Handle mentions — resolve LID JIDs to phone JIDs.
+	// WhatsApp's MentionedJID field requires phone-format JIDs
+	// (e.g. 923001234567@s.whatsapp.net). LID-format JIDs cause
+	// misrouted push notifications to wrong group members.
 	if len(req.Mentions) > 0 {
-		mentionJIDs := make([]string, len(req.Mentions))
-		copy(mentionJIDs, req.Mentions)
-		msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{
-			MentionedJID: mentionJIDs,
+		mentionJIDs := s.resolveToPhoneJIDs(r.Context(), req.Mentions)
+		if len(mentionJIDs) > 0 {
+			msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{
+				MentionedJID: mentionJIDs,
+			}
 		}
 	}
 
-	// Handle quoting — StanzaID only. Participant and QuotedMessage are
-	// intentionally omitted: LID-format Participant JIDs cause WhatsApp to
-	// misroute reply notifications to wrong group members. StanzaID alone
-	// is sufficient for clients to look up and display the quoted message.
+	// Handle quoting — set StanzaID + Participant (phone-format JID).
+	// Participant MUST be a phone-format JID (e.g. 923001234567@s.whatsapp.net).
+	// LID-format Participant JIDs caused WhatsApp to misroute reply
+	// notifications to wrong group members. Without Participant at all,
+	// WhatsApp's server-side StanzaID lookup is unreliable and sends
+	// "Replied to you" notifications to random members. Setting Participant
+	// with a resolved phone JID fixes both issues.
 	if req.QuotedMessageID != "" {
 		if msg.ExtendedTextMessage == nil {
 			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
@@ -130,6 +188,12 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 			msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{}
 		}
 		msg.ExtendedTextMessage.ContextInfo.StanzaID = proto.String(req.QuotedMessageID)
+		if req.QuotedParticipant != "" {
+			resolved := s.resolveToPhoneJIDs(r.Context(), []string{req.QuotedParticipant})
+			if len(resolved) > 0 {
+				msg.ExtendedTextMessage.ContextInfo.Participant = proto.String(resolved[0])
+			}
+		}
 	}
 
 	// Set ephemeral expiry on text messages
@@ -147,6 +211,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.db.IncrementTelemetry("messages_sent")
+	s.persistOutgoing(toJID.String(), resp.ID, req.Text, "", "", "", 0, req.QuotedMessageID, req.QuotedParticipant, resp.Timestamp)
 	writeJSON(w, http.StatusOK, SendResponse{
 		Success:   true,
 		MessageID: resp.ID,
@@ -289,6 +354,7 @@ func (s *Server) handleSendMedia(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.db.IncrementTelemetry("media_sent")
+	s.persistOutgoing(toJID.String(), resp.ID, caption, mediaType, detectMimeType(header.Filename), header.Filename, int64(len(data)), "", "", resp.Timestamp)
 	writeJSON(w, http.StatusOK, SendResponse{
 		Success:   true,
 		MessageID: resp.ID,
@@ -472,4 +538,73 @@ func (s *Server) handleRevokeMessage(w http.ResponseWriter, r *http.Request) {
 		Success:   true,
 		MessageID: resp.ID,
 	})
+}
+
+// resolveToPhoneJIDs converts a slice of JID strings to phone-format JIDs.
+// LID-format JIDs (e.g. 100000000000001@lid) are looked up via whatsmeow's
+// LID store and converted to phone JIDs (e.g. 923001234567@s.whatsapp.net).
+// Device suffixes (e.g. :75) are stripped. JIDs that cannot be resolved are
+// silently dropped to prevent false-flag push notifications.
+func (s *Server) resolveToPhoneJIDs(ctx context.Context, jids []string) []string {
+	if s.connMgr.Client == nil || s.connMgr.Client.Store == nil {
+		return jids // fallback: pass through as-is if client unavailable
+	}
+
+	seen := make(map[string]bool, len(jids))
+	result := make([]string, 0, len(jids))
+
+	for _, raw := range jids {
+		// Strip device suffix (e.g. "100000000000000:90@lid" -> "100000000000000@lid")
+		clean := raw
+		if atIdx := strings.Index(clean, "@"); atIdx > 0 {
+			user := clean[:atIdx]
+			server := clean[atIdx:]
+			if colonIdx := strings.Index(user, ":"); colonIdx > 0 {
+				user = user[:colonIdx]
+			}
+			clean = user + server
+		}
+
+		var phoneJID string
+
+		switch {
+		case strings.HasSuffix(clean, "@s.whatsapp.net"):
+			// Already phone format — use as-is
+			phoneJID = clean
+
+		case strings.HasSuffix(clean, "@lid"):
+			// LID format — look up phone number
+			parsed, err := types.ParseJID(clean)
+			if err != nil {
+				s.logger.Warn("mention: invalid LID JID, dropping",
+					"jid", raw, "error", err)
+				continue
+			}
+			pn, err := s.connMgr.Client.Store.LIDs.GetPNForLID(ctx, parsed)
+			if err != nil {
+				s.logger.Warn("mention: LID lookup failed, dropping",
+					"jid", raw, "error", err)
+				continue
+			}
+			if pn.IsEmpty() {
+				s.logger.Warn("mention: no phone number for LID, dropping",
+					"jid", raw)
+				continue
+			}
+			phoneJID = pn.String()
+
+		default:
+			s.logger.Warn("mention: unrecognized JID format, dropping",
+				"jid", raw)
+			continue
+		}
+
+		// Deduplicate
+		if !seen[phoneJID] {
+			seen[phoneJID] = true
+			result = append(result, phoneJID)
+		}
+	}
+
+	return result
 }

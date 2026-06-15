@@ -33,7 +33,7 @@ services:
     environment:
       POSTGRES_DB: whatsapp
       POSTGRES_USER: bridge
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bridge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -45,60 +45,86 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # --- Backups ---
+  # Uses prodrigestivill/postgres-backup-local - community-maintained, battle-tested.
+  # Tiered retention (daily/weekly/monthly), built-in healthcheck, image-version matched
+  # to the source PG.
+  # Backups land in iCloud via bind mount, so they sync to all Apple devices automatically.
+  # Restore: see pg-backup/RESTORE.md
+
+  pg_backup:
+    image: prodrigestivill/postgres-backup-local:17
+    container_name: eva_pg_backup
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: bridge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: whatsapp
+      # Custom format dump (-Fc): single file, compressed, supports parallel restore + selective table restore.
+      # Same format as our RESTORE.md docs reference.
+      POSTGRES_EXTRA_OPTS: "-Fc"
+      # Daily at 03:00 Asia/Karachi (TZ honored via the TZ var below).
+      SCHEDULE: "0 3 * * *"
+      # Retention - keep tiered history so we have rollback options at multiple horizons.
+      BACKUP_KEEP_DAYS: "14"
+      BACKUP_KEEP_WEEKS: "8"
+      BACKUP_KEEP_MONTHS: "6"
+      # On-disk layout: /backups/{last,daily,weekly,monthly}/
+      BACKUP_DIR: /backups
+      TZ: Asia/Karachi
+      # Healthcheck endpoint on :8080 (HTTP GET /); supervisor can probe this.
+      HEALTHCHECK_PORT: "8080"
+    volumes:
+      # Bind-mount the host's iCloud-synced dir. Files sync to all Apple devices automatically.
+      - ./backups:/backups
+    restart: unless-stopped
+
   # --- Vector Search (pgvector in PostgreSQL) ---
 
   embedder:
     build:
       context: ./embedder
     environment:
-      PG_DSN: postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/whatsapp?sslmode=disable
+      PG_DSN: postgres://bridge:${POSTGRES_PASSWORD:-changeme}@postgres:5432/whatsapp?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
 
-  transcriber:
-    build:
-      context: ./transcriber
-    environment:
-      PG_DSN: postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/whatsapp?sslmode=disable
-      WHISPER_URL: http://whisper:8000
-      BRIDGE_URL: http://bridge:8080
-    depends_on:
-      postgres:
-        condition: service_healthy
-      bridge:
-        condition: service_healthy
-    restart: unless-stopped
-    profiles:
-      - whisper
+  # Transcriber runs host-native (currently via nohup; planned migration to
+  # launchd com.eva.transcriber). Kept host-side so it can read audio files from
+  # ./media/audios/ directly and call the host whisper at :8443 without
+  # a network hop. The Docker definition was removed 2026-05-24.
 
-  # --- Optional ---
+  # --- Dashboard ---
 
   dashboard:
     build:
       context: ./dashboard
     ports:
-      - "127.0.0.1:9090:9090"
+      - "0.0.0.0:9090:9090"
     environment:
-      BRIDGE_URL: http://bridge:8080
+      TZ: Asia/Karachi
+      BRIDGE_URL: http://host.docker.internal:8080
       DB_DRIVER: postgres
-      PG_DSN: postgres://bridge:${POSTGRES_PASSWORD:-bridge}@postgres:5432/whatsapp?sslmode=disable
+      PG_DSN: postgres://bridge:${POSTGRES_PASSWORD:-changeme}@host.docker.internal:5432/whatsapp?sslmode=disable
+      CONFIG_PATH: /app/config.toml
+    volumes:
+      - ./config.toml:/app/config.toml:ro
     depends_on:
-      bridge:
-        condition: service_healthy
       postgres:
         condition: service_healthy
     restart: unless-stopped
-    profiles:
-      - dashboard
 
-  whisper:
-    image: ghcr.io/speaches-ai/speaches:latest-cpu
-    ports:
-      - "127.0.0.1:8443:8000"
-    volumes:
-      - ./data/whisper-cache:/home/ubuntu/.cache/huggingface/hub
-    restart: unless-stopped
-    profiles:
-      - whisper
+# Whisper runs host-native via launchd (com.eva.whisper) using the homebrew
+# whisper-server binary with Apple Metal GPU acceleration. The Docker variant
+# was removed 2026-05-24 - keeping two definitions for port 8443 was confusing
+# and the Docker CPU build is meaningfully slower on the M4.
+#
+# Host process: /opt/homebrew/bin/whisper-server
+# Model:        ./models/ggml-large-v3.bin
+# Endpoint:     http://127.0.0.1:8443/inference
