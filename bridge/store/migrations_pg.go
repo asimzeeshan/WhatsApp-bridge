@@ -183,7 +183,21 @@ var pgMigrations = []string{
 	// Idempotent (ON CONFLICT DO NOTHING) so it can be re-run safely.
 	// Empty strings / zero-length bytea -> NULL (semantic NULL = "never attempted/unknown").
 	// For historical rows the created_at proxy is the original message timestamp.
-	`INSERT INTO messages_media (
+	//
+	// The media_download_state sidecar predates the normalized schema and is dropped in v13.
+	// On a FRESH database it was never created, which would break the LEFT JOIN below, so we
+	// (re)create an empty one here to keep this historical migration self-contained. On a clean
+	// install it backfills nothing from the sidecar (all s.* are NULL); already-migrated DBs
+	// never re-run v12, so this is a no-op for them. v13 drops it again.
+	`CREATE TABLE IF NOT EXISTS media_download_state (
+		message_id      TEXT NOT NULL,
+		chat_jid        TEXT NOT NULL,
+		attempts        INTEGER NOT NULL DEFAULT 0,
+		last_error      TEXT,
+		last_attempt_at TIMESTAMPTZ,
+		PRIMARY KEY (message_id, chat_jid)
+	);
+	INSERT INTO messages_media (
 		message_id, chat_jid, media_type, mime_type, filename, file_length,
 		media_key, file_sha256, file_enc_sha256, media_url, direct_path,
 		local_path, downloaded_at,
