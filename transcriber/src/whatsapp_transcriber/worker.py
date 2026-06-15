@@ -36,6 +36,10 @@ DEFAULT_BRIDGE_URL = "http://127.0.0.1:8080"
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_POLL_INTERVAL = 30
 
+# Sentinel: a present-but-unconvertible audio file. Distinct from None (transient
+# whisper/download failure -> retry) so the loop can give up instead of re-trying forever.
+UNPROCESSABLE = object()
+
 running = True
 whisper_available = True
 consecutive_failures = 0
@@ -120,7 +124,8 @@ def convert_to_wav(file_path: str) -> str | None:
     whisper.cpp requires WAV input - it rejects raw ogg/opus.
     Returns path to temporary WAV file, or None on failure.
     """
-    wav_path = tempfile.mktemp(suffix=".wav")
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")  # mkstemp is TOCTOU-safe (mktemp is not)
+    os.close(fd)
 
     # Try opusdec first (handles ogg/opus natively)
     if shutil.which("opusdec"):
@@ -159,8 +164,10 @@ def transcribe_file(file_path: str, whisper_url: str, model: str, mime_type: str
 
     wav_path = convert_to_wav(file_path)
     if not wav_path:
-        logger.warning("WAV conversion failed for %s", file_path)
-        return None
+        # File is present but neither opusdec nor afconvert can convert it -> it's
+        # corrupt/unsupported; retrying won't help. Signal "give up" (not a retry).
+        logger.warning("WAV conversion failed (unprocessable) for %s", file_path)
+        return UNPROCESSABLE
 
     try:
         with open(wav_path, "rb") as f:
@@ -294,6 +301,14 @@ def run_loop(pg_dsn: str, whisper_url: str, model: str, bridge_url: str,
                         continue
 
                 text = transcribe_file(local_path, whisper_url, model, mime_type)
+                if text is UNPROCESSABLE:
+                    # Present file that won't convert - give up so it leaves the pool
+                    # instead of being retried every cycle forever.
+                    update_transcription(pg_conn, msg_id, chat_jid, "[unprocessable]")
+                    logger.warning("marked unprocessable: %s", msg_id)
+                    consecutive_failures = 0
+                    transcribed += 1
+                    continue
                 if text is None:
                     consecutive_failures += 1
                     failed += 1

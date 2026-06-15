@@ -82,14 +82,14 @@ func (db *DB) upsertMessageMedia(m *Message) {
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (message_id, chat_jid) DO UPDATE SET
 			media_type      = excluded.media_type,
-			mime_type       = excluded.mime_type,
-			filename        = excluded.filename,
-			file_length     = excluded.file_length,
-			media_key       = excluded.media_key,
-			file_sha256     = excluded.file_sha256,
-			file_enc_sha256 = excluded.file_enc_sha256,
-			media_url       = excluded.media_url,
-			direct_path     = excluded.direct_path`,
+			mime_type       = COALESCE(excluded.mime_type, messages_media.mime_type),
+			filename        = COALESCE(excluded.filename, messages_media.filename),
+			file_length     = COALESCE(excluded.file_length, messages_media.file_length),
+			media_key       = COALESCE(excluded.media_key, messages_media.media_key),
+			file_sha256     = COALESCE(excluded.file_sha256, messages_media.file_sha256),
+			file_enc_sha256 = COALESCE(excluded.file_enc_sha256, messages_media.file_enc_sha256),
+			media_url       = COALESCE(excluded.media_url, messages_media.media_url),
+			direct_path     = COALESCE(excluded.direct_path, messages_media.direct_path)`,
 		m.ID, m.ChatJID, m.MediaType, nilStr(m.MimeType), nilStr(m.Filename), nilInt(m.FileLength),
 		nilBytes(m.MediaKey), nilBytes(m.FileSHA256), nilBytes(m.FileEncSHA256),
 		nilStr(m.MediaURL), nilStr(m.DirectPath))

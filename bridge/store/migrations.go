@@ -245,4 +245,18 @@ var migrations = []string{
 		PRIMARY KEY (poll_message_id, chat_jid, voter)
 	);
 	CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes (poll_message_id, chat_jid);`,
+
+	// v15: transcription_lang / OCR cache / auto-stamped updated_at (mirrors the PG
+	// migration). SQLite uses an AFTER UPDATE trigger; recursive_triggers is off by
+	// default so the self-UPDATE does not re-fire.
+	`ALTER TABLE messages_media ADD COLUMN transcription_lang TEXT;
+	ALTER TABLE messages_media ADD COLUMN ocr_text TEXT;
+	ALTER TABLE messages_media ADD COLUMN ocred_at TIMESTAMP;
+	ALTER TABLE messages_media ADD COLUMN updated_at TIMESTAMP;
+	CREATE TRIGGER IF NOT EXISTS trg_messages_media_updated_at
+		AFTER UPDATE ON messages_media FOR EACH ROW
+		BEGIN
+			UPDATE messages_media SET updated_at = CURRENT_TIMESTAMP
+			WHERE message_id = NEW.message_id AND chat_jid = NEW.chat_jid;
+		END;`,
 }

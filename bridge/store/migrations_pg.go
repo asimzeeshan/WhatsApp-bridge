@@ -256,4 +256,19 @@ var pgMigrations = []string{
 		PRIMARY KEY (poll_message_id, chat_jid, voter)
 	);
 	CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes (poll_message_id, chat_jid);`,
+
+	// v15: transcription_lang / OCR cache / auto-stamped updated_at.
+	// First applied out-of-band via psql; this migration makes a fresh build, DR
+	// restore, or the open-source bridge produce the same schema. Fully idempotent.
+	`ALTER TABLE messages_media
+		ADD COLUMN IF NOT EXISTS transcription_lang TEXT,
+		ADD COLUMN IF NOT EXISTS ocr_text           TEXT,
+		ADD COLUMN IF NOT EXISTS ocred_at            TIMESTAMPTZ,
+		ADD COLUMN IF NOT EXISTS updated_at          TIMESTAMPTZ;
+
+	CREATE OR REPLACE FUNCTION set_messages_media_updated_at() RETURNS trigger
+		LANGUAGE plpgsql AS $fn$ BEGIN NEW.updated_at = now(); RETURN NEW; END; $fn$;
+	DROP TRIGGER IF EXISTS trg_messages_media_updated_at ON messages_media;
+	CREATE TRIGGER trg_messages_media_updated_at BEFORE UPDATE ON messages_media
+		FOR EACH ROW EXECUTE FUNCTION set_messages_media_updated_at();`,
 }

@@ -69,18 +69,38 @@ func Allow(msgID string, now time.Time) bool {
 }
 
 // Done releases the single-flight slot. Always call after Allow returned true.
+// Idempotent (safe to call alongside Abort).
 func Done() {
 	mu.Lock()
 	inFlight = false
 	mu.Unlock()
 }
 
-// Register creates a waiter channel for msgID. Caller must Cleanup when done.
-func Register(msgID string) chan Result {
-	ch := make(chan Result, 1)
+// Abort rolls back the budget that Allow() consumed, for the case where the receipt
+// was NOT actually sent (e.g. SendMediaRetryReceipt failed). Without this, a transient
+// send failure would lock the message out for the full 24h dedupe window and silently
+// shrink the daily cap. It does NOT touch the single-flight slot — Done() releases that.
+// lastSend is intentionally left as set so pacing stays conservative (the ban-safe choice).
+func Abort(msgID string) {
 	mu.Lock()
-	waiters[msgID] = ch
+	if dayCount > 0 {
+		dayCount--
+	}
+	delete(tried, msgID)
 	mu.Unlock()
+}
+
+// Register creates a waiter channel for msgID, or returns the existing one if a request
+// for the same message is already waiting (so a second registration can't orphan the
+// first waiter). Caller must Cleanup when done.
+func Register(msgID string) chan Result {
+	mu.Lock()
+	defer mu.Unlock()
+	if ch, ok := waiters[msgID]; ok {
+		return ch
+	}
+	ch := make(chan Result, 1)
+	waiters[msgID] = ch
 	return ch
 }
 

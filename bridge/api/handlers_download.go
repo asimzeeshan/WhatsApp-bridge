@@ -133,19 +133,33 @@ func buildDownloadable(msg *store.Message, directPath, url string) whatsmeow.Dow
 }
 
 // buildMessageInfo constructs the minimal MessageInfo that SendMediaRetryReceipt needs.
-func buildMessageInfo(msg *store.Message) *types.MessageInfo {
-	chat, _ := types.ParseJID(msg.ChatJID)
-	sender, _ := types.ParseJID(msg.Sender)
+// It returns an error on a malformed JID so the caller can bail BEFORE sending a receipt
+// or consuming budget — a garbage receipt is exactly the unusual outbound signal the
+// ban-safety budget exists to avoid. The sender (participant) is only required for group
+// messages, since that's the only case the receipt uses it.
+func buildMessageInfo(msg *store.Message) (*types.MessageInfo, error) {
+	chat, err := types.ParseJID(msg.ChatJID)
+	if err != nil {
+		return nil, fmt.Errorf("bad chat jid %q: %w", msg.ChatJID, err)
+	}
+	isGroup := strings.HasSuffix(msg.ChatJID, "@g.us")
+	var sender types.JID
+	if isGroup {
+		sender, err = types.ParseJID(msg.Sender)
+		if err != nil {
+			return nil, fmt.Errorf("bad sender jid %q: %w", msg.Sender, err)
+		}
+	}
 	return &types.MessageInfo{
 		ID: msg.ID,
 		MessageSource: types.MessageSource{
 			Chat:     chat,
 			Sender:   sender,
 			IsFromMe: msg.IsFromMe,
-			IsGroup:  strings.HasSuffix(msg.ChatJID, "@g.us"),
+			IsGroup:  isGroup,
 		},
 		Timestamp: time.UnixMilli(msg.Timestamp),
-	}
+	}, nil
 }
 
 // tryMediaRetry attempts to recover purged media (403/404/410) by asking the sender
@@ -162,16 +176,23 @@ func (s *Server) tryMediaRetry(ctx context.Context, msg *store.Message, origErr 
 	if len(msg.MediaKey) == 0 {
 		return nil, origErr
 	}
+	// Build + validate the receipt target BEFORE consuming any budget, so a malformed
+	// JID never spends budget or emits a garbage receipt.
+	info, err := buildMessageInfo(msg)
+	if err != nil {
+		s.logger.Warn("media retry skipped: bad message info", "msg_id", msg.ID, "error", err)
+		return nil, origErr
+	}
 	if !mediaretry.Allow(msg.ID, time.Now()) {
 		return nil, origErr // budget exhausted / paced out / already tried — stay quiet
 	}
 	defer mediaretry.Done()
 
-	info := buildMessageInfo(msg)
 	ch := mediaretry.Register(msg.ID)
 	defer mediaretry.Cleanup(msg.ID)
 
 	if err := s.connMgr.Client.SendMediaRetryReceipt(ctx, info, msg.MediaKey); err != nil {
+		mediaretry.Abort(msg.ID) // receipt never went out — roll back the budget
 		s.logger.Warn("media retry receipt failed", "msg_id", msg.ID, "error", err)
 		return nil, origErr
 	}
