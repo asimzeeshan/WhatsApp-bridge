@@ -46,7 +46,7 @@ jobs:
 
       - name: Create PR for Go deps
         if: steps.go-changes.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "chore(deps): update Go dependencies"
@@ -66,27 +66,38 @@ jobs:
     name: Update Python Dependencies
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        project: [mcp-server, dashboard]
+        # Each project locks with uv.lock and its Dockerfile installs with `uv sync --frozen`,
+        # so the job upgrades uv.lock and validates it exactly the way the image does.
+        include:
+          - project: mcp-server
+            package: whatsapp_mcp
+            sync-args: ""
+          - project: dashboard
+            package: whatsapp_dashboard
+            sync-args: "--extra postgres"
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v7
+      - uses: astral-sh/setup-uv@v10
         with:
-          python-version: '3.12'
+          python-version: '3.13'  # keep in step with the python:3.13-slim Docker images
 
-      - name: Install uv
-        run: pip install uv
+      - name: Upgrade uv.lock
+        working-directory: ${{ matrix.project }}
+        run: uv lock --upgrade
 
-      - name: Update and check Python dependencies
+      - name: Install from the lockfile and import-check (same as the Dockerfile)
         working-directory: ${{ matrix.project }}
         run: |
-          uv pip compile pyproject.toml -o requirements.txt --upgrade 2>/dev/null || true
+          uv sync --frozen --no-dev ${{ matrix.sync-args }}
+          uv run --frozen python -c "import ${{ matrix.package }}"
 
       - name: Check for changes
         id: py-changes
         run: |
-          if git diff --quiet; then
+          if git diff --quiet -- "${{ matrix.project }}/uv.lock"; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -94,15 +105,18 @@ jobs:
 
       - name: Create PR for Python deps
         if: steps.py-changes.outputs.changed == 'true'
-        env:
-          PROJECT_NAME: ${{ matrix.project }}
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore(deps): update Python dependencies"
-          title: "chore(deps): nightly Python dependency update"
+          add-paths: ${{ matrix.project }}/uv.lock
+          commit-message: "chore(deps): update ${{ matrix.project }} Python dependencies"
+          title: "chore(deps): nightly Python dependency update (${{ matrix.project }})"
           body: |
-            Automated nightly update of Python dependencies.
+            Automated nightly update of `${{ matrix.project }}` Python dependencies.
+
+            - `uv lock --upgrade`
+            - `uv sync --frozen --no-dev ${{ matrix.sync-args }}` (same as the Dockerfile): passing
+            - Import check of `${{ matrix.package }}`: passing
           branch: deps/python-${{ matrix.project }}-nightly
           delete-branch: true
           labels: dependencies
