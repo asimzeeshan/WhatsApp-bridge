@@ -54,6 +54,9 @@ jobs:
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          sign-commits: true   # commit via the GitHub API so it shows as Verified
+          author: Asim Zeeshan <asim@techbytes.pk>
+          committer: Asim Zeeshan <asim@techbytes.pk>
           commit-message: "chore(deps): update Go dependencies"
           title: "chore(deps): nightly Go dependency update"
           body: |
@@ -113,6 +116,9 @@ jobs:
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          sign-commits: true   # commit via the GitHub API so it shows as Verified
+          author: Asim Zeeshan <asim@techbytes.pk>
+          committer: Asim Zeeshan <asim@techbytes.pk>
           add-paths: ${{ matrix.project }}/uv.lock
           commit-message: "chore(deps): update ${{ matrix.project }} Python dependencies"
           title: "chore(deps): nightly Python dependency update (${{ matrix.project }})"
