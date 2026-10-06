@@ -4,6 +4,10 @@ on:
   schedule:
     - cron: '0 3 * * *'  # 3 AM UTC daily
   workflow_dispatch:       # Allow manual trigger
+  pull_request:            # Exercise the workflow on any PR that changes it, so a bad edit fails
+    paths:                 # on the PR instead of at 3 AM after merge (dependency PRs are skipped)
+      - .github/workflows/nightly-deps.yml
+      - .github/dependabot.yml
 
 permissions:
   contents: write
@@ -12,14 +16,15 @@ permissions:
 jobs:
   update-go-deps:
     name: Update Go Dependencies
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.27'  # keep in step with bridge/go.mod and bridge/Dockerfile
           check-latest: true
+          cache-dependency-path: bridge/go.sum
 
       - name: Update Go dependencies
         working-directory: bridge
@@ -45,8 +50,8 @@ jobs:
           fi
 
       - name: Create PR for Go deps
-        if: steps.go-changes.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v8
+        if: github.event_name != 'pull_request' && steps.go-changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "chore(deps): update Go dependencies"
@@ -64,7 +69,7 @@ jobs:
 
   update-python-deps:
     name: Update Python Dependencies
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -78,9 +83,9 @@ jobs:
             package: whatsapp_dashboard
             sync-args: "--extra postgres"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: '3.13'  # keep in step with the python:3.13-slim Docker images
 
@@ -104,8 +109,8 @@ jobs:
           fi
 
       - name: Create PR for Python deps
-        if: steps.py-changes.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v8
+        if: github.event_name != 'pull_request' && steps.py-changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           add-paths: ${{ matrix.project }}/uv.lock

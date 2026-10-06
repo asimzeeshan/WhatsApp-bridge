@@ -1,0 +1,14 @@
+# Keeps the SHA-pinned actions in .github/workflows current.
+# Actions are pinned to commit SHAs because some publishers (e.g. astral-sh/setup-uv
+# since v8) no longer ship floating major tags, so `@vN` can stop resolving.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    labels:
+      - dependencies
