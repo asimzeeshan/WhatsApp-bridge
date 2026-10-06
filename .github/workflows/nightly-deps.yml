@@ -4,6 +4,10 @@ on:
   schedule:
     - cron: '0 3 * * *'  # 3 AM UTC daily
   workflow_dispatch:       # Allow manual trigger
+  pull_request:            # Exercise the workflow on any PR that changes it, so a bad edit fails
+    paths:                 # on the PR instead of at 3 AM after merge (dependency PRs are skipped)
+      - .github/workflows/nightly-deps.yml
+      - .github/dependabot.yml
 
 permissions:
   contents: write
@@ -46,7 +50,7 @@ jobs:
           fi
 
       - name: Create PR for Go deps
-        if: steps.go-changes.outputs.changed == 'true'
+        if: github.event_name != 'pull_request' && steps.go-changes.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -105,7 +109,7 @@ jobs:
           fi
 
       - name: Create PR for Python deps
-        if: steps.py-changes.outputs.changed == 'true'
+        if: github.event_name != 'pull_request' && steps.py-changes.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
