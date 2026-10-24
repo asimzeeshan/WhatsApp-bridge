@@ -136,6 +136,7 @@ All MCP tools accept an optional `account` parameter. Send operations are blocke
 | `get_unread_messages` | Flat list of all unread messages |
 | `list_contacts` | List all contacts |
 | `get_contact` | Get contact details |
+| `get_profile_picture` | Get (and optionally download) the profile picture of a user, group, or this account |
 | `list_groups` | List all groups |
 | `get_group` | Get group metadata + participants |
 | `send_media` | Send image/video/audio/document |
@@ -194,6 +195,7 @@ All MCP tools accept an optional `account` parameter. Send operations are blocke
 | `/api/send/revoke` | POST | Revoke/delete a message |
 | `/api/messages` | GET | Message history |
 | `/api/contacts` | GET | All contacts |
+| `/api/profile-picture/{jid}` | GET | Profile picture info (`me` = own account); `?download=true`, `?preview=true`, `?output_dir=` |
 | `/api/groups` | GET | All groups |
 | `/api/links` | GET | Indexed links |
 | `/api/telemetry/daily` | GET | Daily stats |

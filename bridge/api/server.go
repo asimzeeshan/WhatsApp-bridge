@@ -64,6 +64,9 @@ func NewServer(db *store.DB, connMgr *connection.Manager, cfg *config.Config, lo
 		r.Get("/contacts", s.handleListContacts)
 		r.Get("/contacts/{jid}", s.handleGetContact)
 
+		// Profile pictures ("me" = own account)
+		r.Get("/profile-picture/{jid}", s.handleGetProfilePicture)
+
 		// Groups
 		r.Get("/groups", s.handleListGroups)
 		r.Get("/groups/{jid}", s.handleGetGroup)
